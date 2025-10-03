@@ -1914,114 +1914,117 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
 
                                 # Generate speech using Kokoro TTS model
                                 result = await kokoro_model.synthesize_speech(
-                                text=response,
-                                voice="hm_omega"  # Use Kokoro Hindi voice instead of ऋतिका
-                            )
+                                    text=response,
+                                    voice="hm_omega"  # Use Kokoro Hindi voice instead of ऋतिका
+                                )
 
-                            if not result.get("success", False):
-                                raise Exception(f"Kokoro TTS generation failed: {result.get('error', 'Unknown error')}")
+                                if not result.get("success", False):
+                                    raise Exception(f"Kokoro TTS generation failed: {result.get('error', 'Unknown error')}")
 
-                            audio_data = result["audio_data"]
-                            sample_rate = result.get("sample_rate", 24000)
+                                audio_data = result["audio_data"]
+                                sample_rate = result.get("sample_rate", 24000)
 
-                            # End TTS timing
-                            tts_generation_time = performance_monitor.end_timing(tts_timing_id)
+                                # End TTS timing
+                                tts_generation_time = performance_monitor.end_timing(tts_timing_id)
 
-                            if audio_data is not None and len(audio_data) > 0:
-                                # Audio quality validation and normalization
-                                audio_rms = np.sqrt(np.mean(audio_data**2))
-                                audio_peak = np.max(np.abs(audio_data))
+                                if audio_data is not None and len(audio_data) > 0:
+                                    # Audio quality validation and normalization
+                                    audio_rms = np.sqrt(np.mean(audio_data**2))
+                                    audio_peak = np.max(np.abs(audio_data))
 
-                                logger.info(f"🎵 Audio quality check - RMS: {audio_rms:.6f}, Peak: {audio_peak:.6f}")
+                                    logger.info(f"🎵 Audio quality check - RMS: {audio_rms:.6f}, Peak: {audio_peak:.6f}")
 
-                                # Normalize audio if too quiet or too loud
-                                normalized_audio = audio_data
-                                if audio_rms < 0.05:  # Too quiet
-                                    target_rms = 0.2
-                                    gain = target_rms / (audio_rms + 1e-8)
-                                    normalized_audio = audio_data * gain
-                                    logger.info(f"🔊 Audio boosted by {gain:.2f}x (was too quiet)")
-                                elif audio_peak > 0.95:  # Risk of clipping
-                                    gain = 0.9 / audio_peak
-                                    normalized_audio = audio_data * gain
-                                    logger.info(f"🔉 Audio reduced by {gain:.2f}x (preventing clipping)")
+                                    # Normalize audio if too quiet or too loud
+                                    normalized_audio = audio_data
+                                    if audio_rms < 0.05:  # Too quiet
+                                        target_rms = 0.2
+                                        gain = target_rms / (audio_rms + 1e-8)
+                                        normalized_audio = audio_data * gain
+                                        logger.info(f"🔊 Audio boosted by {gain:.2f}x (was too quiet)")
+                                    elif audio_peak > 0.95:  # Risk of clipping
+                                        gain = 0.9 / audio_peak
+                                        normalized_audio = audio_data * gain
+                                        logger.info(f"🔉 Audio reduced by {gain:.2f}x (preventing clipping)")
 
-                                # Convert numpy array to proper WAV format with headers
-                                import soundfile as sf
-                                from io import BytesIO
+                                    # Convert numpy array to proper WAV format with headers
+                                    import soundfile as sf
+                                    from io import BytesIO
 
-                                # Create WAV file in memory with normalized audio
-                                wav_buffer = BytesIO()
-                                sf.write(wav_buffer, normalized_audio, sample_rate, format='WAV', subtype='PCM_16')
-                                wav_bytes = wav_buffer.getvalue()
-                                wav_buffer.close()
+                                    # Create WAV file in memory with normalized audio
+                                    wav_buffer = BytesIO()
+                                    sf.write(wav_buffer, normalized_audio, sample_rate, format='WAV', subtype='PCM_16')
+                                    wav_bytes = wav_buffer.getvalue()
+                                    wav_buffer.close()
 
-                                # Validate WAV file creation
-                                if len(wav_bytes) < 100:  # WAV header alone is ~44 bytes
-                                    raise Exception(f"WAV file too small: {len(wav_bytes)} bytes")
+                                    # Validate WAV file creation
+                                    if len(wav_bytes) < 100:  # WAV header alone is ~44 bytes
+                                        raise Exception(f"WAV file too small: {len(wav_bytes)} bytes")
 
-                                # Verify WAV headers
-                                if wav_bytes[:4] != b'RIFF' or wav_bytes[8:12] != b'WAVE':
-                                    raise Exception("Invalid WAV file headers")
+                                    # Verify WAV headers
+                                    if wav_bytes[:4] != b'RIFF' or wav_bytes[8:12] != b'WAVE':
+                                        raise Exception("Invalid WAV file headers")
 
-                                logger.info(f"✅ WAV file created: {len(wav_bytes)} bytes with proper headers")
+                                    logger.info(f"✅ WAV file created: {len(wav_bytes)} bytes with proper headers")
 
-                                # Convert to base64 for transmission
-                                audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                                    # Convert to base64 for transmission
+                                    audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
 
-                                # Calculate audio duration from actual audio samples
-                                audio_duration_ms = (len(audio_data) / sample_rate) * 1000
+                                    # Calculate audio duration from actual audio samples
+                                    audio_duration_ms = (len(audio_data) / sample_rate) * 1000
 
-                                # Send audio response
-                                await websocket.send_text(json.dumps({
-                                    "type": "audio_response",
-                                    "audio_data": audio_b64,
-                                    "chunk_id": chunk_id,
-                                    "voice": "hm_omega",  # Kokoro Hindi voice
-                                    "format": "wav",
-                                    "metadata": {
-                                        "audio_duration_ms": audio_duration_ms,
-                                        "generation_time_ms": tts_generation_time,
-                                        "sample_rate": sample_rate,
-                                        "channels": 1,
-                                        "format": "WAV",
-                                        "subtype": "PCM_16"
-                                    }
-                                }))
-                                
-                                streaming_logger.info(f"[TTS-KOKORO] Audio response generated for chunk {chunk_id} in {tts_generation_time:.1f}ms")
+                                    # Send audio response
+                                    await websocket.send_text(json.dumps({
+                                        "type": "audio_response",
+                                        "audio_data": audio_b64,
+                                        "chunk_id": chunk_id,
+                                        "voice": "hm_omega",  # Kokoro Hindi voice
+                                        "format": "wav",
+                                        "metadata": {
+                                            "audio_duration_ms": audio_duration_ms,
+                                            "generation_time_ms": tts_generation_time,
+                                            "sample_rate": sample_rate,
+                                            "channels": 1,
+                                            "format": "WAV",
+                                            "subtype": "PCM_16"
+                                        }
+                                    }))
 
-                                # Log performance breakdown
-                                performance_monitor.log_latency_breakdown({
-                                    "voxtral_processing_ms": voxtral_processing_time,
-                                    "kokoro_generation_ms": tts_generation_time,
-                                    "audio_conversion_ms": 0,  # Already included in generation
-                                    "total_end_to_end_ms": voxtral_processing_time + tts_generation_time
-                                })
-                                
-                            else:
-                                streaming_logger.warning(f"[TTS-DIRECT] Failed to generate audio for chunk {chunk_id}")
-                                
-                        except Exception as tts_error:
-                            streaming_logger.error(f"[TTS-DIRECT] Error generating audio response: {tts_error}")
-                            # End timing even on error
-                            if 'tts_timing_id' in locals():
-                                performance_monitor.end_timing(tts_timing_id)
+                                    streaming_logger.info(f"[TTS-KOKORO] Audio response generated for chunk {chunk_id} in {tts_generation_time:.1f}ms")
 
-                    # Update recent response tracking
-                    if response and response.strip():
-                        recent_responses[client_id] = response
-                        streaming_logger.info(f"[CONVERSATION] Unique response sent for chunk {chunk_id}: '{response[:50]}...'")
+                                    # Log performance breakdown
+                                    performance_monitor.log_latency_breakdown({
+                                        "voxtral_processing_ms": voxtral_processing_time,
+                                        "kokoro_generation_ms": tts_generation_time,
+                                        "audio_conversion_ms": 0,  # Already included in generation
+                                        "total_end_to_end_ms": voxtral_processing_time + tts_generation_time
+                                    })
+
+                                else:
+                                    streaming_logger.warning(f"[TTS-DIRECT] Failed to generate audio for chunk {chunk_id}")
+
+                            except Exception as tts_error:
+                                streaming_logger.error(f"[TTS-DIRECT] Error generating audio response: {tts_error}")
+                                # End timing even on error
+                                if 'tts_timing_id' in locals():
+                                    performance_monitor.end_timing(tts_timing_id)
+
+                        # Update recent response tracking
+                        if response and response.strip():
+                            recent_responses[client_id] = response
+                            streaming_logger.info(f"[CONVERSATION] Unique response sent for chunk {chunk_id}: '{response[:50]}...'")
+                        else:
+                            streaming_logger.info(f"[CONVERSATION] Silence detected for chunk {chunk_id} - no response needed")
                     else:
-                        streaming_logger.info(f"[CONVERSATION] Silence detected for chunk {chunk_id} - no response needed")
+                        streaming_logger.info(f"[CONVERSATION] Duplicate response detected for chunk {chunk_id} - skipping")
                 else:
-                    streaming_logger.info(f"[CONVERSATION] Duplicate response detected for chunk {chunk_id} - skipping")
-            else:
-                streaming_logger.warning(f"[CONVERSATION] Processing failed for chunk {chunk_id}")
-                
+                    streaming_logger.warning(f"[CONVERSATION] Processing failed for chunk {chunk_id}")
+
         except Exception as e:
-            streaming_logger.error(f"[CONVERSATION] Voxtral processing error for chunk {chunk_id}: {e}")
-        
+            streaming_logger.error(f"[CONVERSATION] Voxtral/Streaming processing error for chunk {chunk_id}: {e}")
+            # End Voxtral timing on error
+            if 'voxtral_timing_id' in locals():
+                performance_monitor.end_timing(voxtral_timing_id)
+
     except Exception as e:
         streaming_logger.error(f"[CONVERSATION] Error handling audio chunk: {e}")
 
