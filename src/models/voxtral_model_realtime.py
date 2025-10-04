@@ -972,16 +972,24 @@ class VoxtralModel:
             full_response = ""
 
             # Stream tokens as they become available
+            last_token_time = inference_start
             try:
                 for token_text in streamer:
                     current_time = time.time()
                     token_count += 1
+
+                    # Calculate inter-token latency
+                    inter_token_latency = (current_time - last_token_time) * 1000
+                    last_token_time = current_time
 
                     # Track first token timing
                     if first_token_time is None:
                         first_token_time = current_time
                         first_token_latency = (first_token_time - inference_start) * 1000
                         realtime_logger.info(f"⚡ FIRST TOKEN: {first_token_latency:.1f}ms - '{token_text}'")
+                    else:
+                        # Log inter-token latency for verification
+                        realtime_logger.debug(f"🔄 Token {token_count}: '{token_text}' (inter-token: {inter_token_latency:.1f}ms)")
 
                     # Yield immediate token for ultra-low latency
                     yield {
@@ -993,6 +1001,7 @@ class VoxtralModel:
                         'confidence': 1.0,
                         'chunk_id': f"{chunk_id}_token_{token_count}",
                         'generation_time_ms': (current_time - inference_start) * 1000,
+                        'inter_token_latency_ms': inter_token_latency,
                         'is_complete': False,
                         'timestamp': current_time,
                         'chunk_sequence': token_count
@@ -1001,10 +1010,14 @@ class VoxtralModel:
                     # Process for word boundaries using semantic chunker
                     semantic_chunk = semantic_chunker.process_token(token_text, current_time)
                     if semantic_chunk:
+                        word_count += 1
+
                         if first_word_time is None:
                             first_word_time = current_time
                             first_word_latency = (first_word_time - inference_start) * 1000
                             realtime_logger.info(f"📝 FIRST WORD: {first_word_latency:.1f}ms - '{semantic_chunk.text}'")
+                        else:
+                            realtime_logger.debug(f"📝 Word {word_count}: '{semantic_chunk.text}' ({semantic_chunk.boundary_type.value})")
 
                         # Yield semantic chunk for immediate TTS processing
                         yield {
@@ -1018,11 +1031,8 @@ class VoxtralModel:
                             'generation_time_ms': (current_time - inference_start) * 1000,
                             'is_complete': False,
                             'timestamp': current_time,
-                            'chunk_sequence': semantic_chunk.word_count
+                            'chunk_sequence': word_count
                         }
-
-                        realtime_logger.debug(f"🎯 Word: '{semantic_chunk.text}' "
-                                            f"({semantic_chunk.boundary_type.value})")
 
                         # Reset word buffer
                         word_buffer = ""

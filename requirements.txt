@@ -15,8 +15,8 @@ tokenizers>=0.15.0
 # Mistral Common with Audio Support (OFFICIAL)
 mistral-common[audio]>=1.8.1
 
-# Kokoro TTS (lightweight alternative to Orpheus)
-kokoro==0.7.4
+# Kokoro TTS (lightweight alternative to Orpheus) - UPDATED to >=0.9.0 for streaming support
+kokoro>=0.9.0
 
 # Audio Processing
 librosa>=0.10.1

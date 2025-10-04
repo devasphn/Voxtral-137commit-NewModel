@@ -24,6 +24,7 @@ if project_root not in sys.path:
 
 from src.utils.config import config
 from src.utils.logging_config import logger
+from src.utils.audio_queue_manager import audio_queue_manager, AudioChunk
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -991,8 +992,48 @@ async def home(request: Request):
                     }
                     break;
 
+                case 'sequential_audio':
+                    // Handle sequential audio chunks from audio queue manager
+                    handleSequentialAudio(data);
+                    break;
+
+                case 'chunked_streaming_audio':
+                    // Legacy handler - redirect to sequential audio
+                    handleSequentialAudio(data);
+                    break;
+
                 default:
                     log(`Unknown message type: ${data.type}`);
+            }
+        }
+
+        function handleSequentialAudio(data) {
+            try {
+                log(`🎵 Received sequential audio chunk ${data.chunk_index} for ${data.conversation_id} (${data.audio_data.length} chars, text: "${data.text_source}")`);
+
+                // Add to audio queue for sequential playback
+                audioQueue.push({
+                    chunkId: data.chunk_id,
+                    audioData: data.audio_data,
+                    sampleRate: data.sample_rate || 24000,
+                    chunkIndex: data.chunk_index,
+                    voice: data.voice || 'unknown',
+                    textSource: data.text_source || '',
+                    conversationId: data.conversation_id,
+                    queuePosition: data.queue_position || 0
+                });
+
+                log(`🎵 Added sequential audio to queue. Queue length: ${audioQueue.length}, chunk index: ${data.chunk_index}`);
+
+                // Start processing queue if not already playing
+                if (!isPlayingAudio) {
+                    processAudioQueue();
+                }
+
+            } catch (error) {
+                log(`❌ Error handling sequential audio: ${error}`);
+                updateStatus('Error processing sequential audio', 'error');
+                console.error('Sequential audio error:', error);
             }
         }
 
@@ -1721,6 +1762,17 @@ async def detect_interruption(websocket: WebSocket, client_id: str) -> bool:
         streaming_logger.error(f"❌ Interruption detection error: {e}")
         return False
 
+async def stop_queue_after_delay(conversation_id: str, delay: float = 2.0):
+    """
+    Stop audio queue after a delay to allow final chunks to play
+    """
+    try:
+        await asyncio.sleep(delay)
+        await audio_queue_manager.stop_conversation_queue(conversation_id)
+        streaming_logger.info(f"🛑 Audio queue stopped for {conversation_id} after {delay}s delay")
+    except Exception as e:
+        streaming_logger.error(f"❌ Error stopping queue for {conversation_id}: {e}")
+
 async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, message: dict, client_id: str):
     """
     ULTRA-LOW LATENCY TOKEN-BY-TOKEN STREAMING PIPELINE
@@ -1790,17 +1842,24 @@ async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, messag
             }))
             return
 
-        # STEP 4: ULTRA-LOW LATENCY TOKEN-BY-TOKEN STREAMING
+        # STEP 4: START AUDIO QUEUE FOR SEQUENTIAL PLAYBACK
+        queue_started = await audio_queue_manager.start_conversation_queue(conversation_id, websocket)
+        if not queue_started:
+            streaming_logger.warning(f"⚠️ Audio queue already exists for {conversation_id}, reusing")
+
+        # STEP 5: ULTRA-LOW LATENCY TOKEN-BY-TOKEN STREAMING
         streaming_start = time.time()
         full_response = ""
         word_count = 0
         token_count = 0
         first_token_sent = False
         first_word_sent = False
+        first_audio_sent = False
 
         # Track performance metrics
         first_token_time = None
         first_word_time = None
+        first_audio_time = None
 
         # Initialize interruption detection
         interruption_detected = False
@@ -1820,6 +1879,7 @@ async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, messag
                 if await detect_interruption(websocket, client_id):
                     interruption_detected = True
                     streaming_logger.info(f"🛑 Interruption detected for {conversation_id}")
+                    await audio_queue_manager.stop_conversation_queue(conversation_id)
                     break
 
                 if chunk_type == 'token_chunk':
@@ -1870,9 +1930,10 @@ async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, messag
                             "timestamp": current_time
                         }))
 
-                        # STEP 5: ULTRA-FAST TTS SYNTHESIS (Target: <50ms)
+                        # STEP 6: ULTRA-FAST TTS SYNTHESIS WITH QUEUE MANAGEMENT (Target: <50ms)
                         tts_start = time.time()
                         try:
+                            # Stream TTS audio chunks - NOW WITH TRUE STREAMING
                             async for tts_chunk in unified_manager.kokoro_model.synthesize_speech_streaming(
                                 chunk_text,
                                 voice=voice_preference,
@@ -1881,35 +1942,44 @@ async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, messag
                                 if tts_chunk.get('audio_chunk') is not None:
                                     audio_data = tts_chunk['audio_chunk']
 
-                                    # Fast audio encoding
-                                    if isinstance(audio_data, bytes):
-                                        audio_b64 = base64.b64encode(audio_data).decode('utf-8')
-                                    else:
-                                        audio_bytes = audio_data.astype(np.int16).tobytes()
-                                        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                                    # Track first audio timing
+                                    if not first_audio_sent:
+                                        first_audio_time = current_time
+                                        first_audio_latency = (first_audio_time - streaming_start) * 1000
+                                        first_audio_sent = True
+                                        streaming_logger.info(f"🔊 FIRST AUDIO: {first_audio_latency:.1f}ms")
+
+                                    # Create audio chunk object for queue
+                                    audio_chunk_obj = AudioChunk(
+                                        audio_data=audio_data if isinstance(audio_data, bytes) else audio_data.astype(np.int16).tobytes(),
+                                        chunk_id=tts_chunk.get('chunk_id', f"{conversation_id}_word_{word_count}_audio_{tts_chunk.get('chunk_index', 0)}"),
+                                        voice=voice_preference,
+                                        sample_rate=tts_chunk.get('sample_rate', 24000),
+                                        chunk_index=tts_chunk.get('chunk_index', 0),
+                                        timestamp=time.time(),
+                                        text_source=chunk_text,
+                                        conversation_id=conversation_id,
+                                        chunk_size_bytes=tts_chunk.get('chunk_size_bytes', 0)
+                                    )
+
+                                    # Enqueue for sequential playback (non-blocking)
+                                    await audio_queue_manager.enqueue_audio(audio_chunk_obj)
 
                                     tts_time = (time.time() - tts_start) * 1000
-
-                                    # Send audio immediately
-                                    await websocket.send_text(json.dumps({
-                                        "type": "chunked_streaming_audio",
-                                        "conversation_id": conversation_id,
-                                        "audio_data": audio_b64,
-                                        "sample_rate": tts_chunk.get('sample_rate', 24000),
-                                        "chunk_sequence": word_count,
-                                        "text_source": chunk_text,
-                                        "synthesis_time_ms": tts_time,
-                                        "is_final_audio": tts_chunk.get('is_final', False),
-                                        "timestamp": time.time()
-                                    }))
+                                    streaming_logger.debug(f"🎵 TTS chunk enqueued: {tts_time:.1f}ms")
 
                         except Exception as tts_error:
                             streaming_logger.error(f"❌ TTS error for '{chunk_text}': {tts_error}")
+                            import traceback
+                            traceback.print_exc()
                             # Continue processing even if TTS fails
 
                 elif chunk_type == 'chunked_streaming_complete':
                     # Calculate final metrics
                     total_time = (time.time() - pipeline_start) * 1000
+
+                    # Get queue statistics before stopping
+                    queue_stats = audio_queue_manager.get_stats(conversation_id)
 
                     # Send final completion with performance metrics
                     await websocket.send_text(json.dumps({
@@ -1921,8 +1991,10 @@ async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, messag
                         "total_time_ms": total_time,
                         "first_token_latency_ms": chunk_data.get('first_token_latency_ms', 0),
                         "first_word_latency_ms": chunk_data.get('first_word_latency_ms', 0),
+                        "first_audio_latency_ms": (first_audio_time - streaming_start) * 1000 if first_audio_time else 0,
                         "streaming_method": "TokenByTokenStreaming",
                         "interruption_detected": interruption_detected,
+                        "queue_stats": queue_stats,
                         "success": True,
                         "timestamp": time.time()
                     }))
@@ -1936,6 +2008,12 @@ async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, messag
                         streaming_logger.info(f"   ⚡ First token: {(first_token_time - streaming_start) * 1000:.1f}ms")
                     if first_word_time:
                         streaming_logger.info(f"   📝 First word: {(first_word_time - streaming_start) * 1000:.1f}ms")
+                    if first_audio_time:
+                        streaming_logger.info(f"   🔊 First audio: {(first_audio_time - streaming_start) * 1000:.1f}ms")
+                    streaming_logger.info(f"   📊 Queue stats: {queue_stats}")
+
+                    # Stop audio queue after a delay to allow final chunks to play
+                    asyncio.create_task(stop_queue_after_delay(conversation_id, delay=2.0))
                     break
 
         except Exception as streaming_error:

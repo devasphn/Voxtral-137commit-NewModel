@@ -264,16 +264,23 @@ class KokoroTTSModel:
                 text = text[:self.max_text_length]
                 tts_logger.warning(f"⚠️ Text truncated to {self.max_text_length} characters for streaming chunk {chunk_id}")
 
-            # ULTRA-LOW LATENCY: Optimized streaming pipeline
+            # ULTRA-LOW LATENCY: TRUE STREAMING - Yield each chunk immediately
             with torch.cuda.amp.autocast(enabled=True):  # Use mixed precision for speed
                 generator = self.pipeline(text, voice=voice, speed=speed)
 
             chunk_count = 0
-            # Pre-allocate for efficiency
-            audio_chunks = []
+            first_chunk_time = None
+            total_audio_bytes = 0
 
+            # ✅ TRUE STREAMING: Yield each audio chunk IMMEDIATELY as generated
             for i, (gs, ps, audio) in enumerate(generator):
                 if audio is not None and len(audio) > 0:
+                    # Track first chunk timing
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time()
+                        first_chunk_latency = (first_chunk_time - synthesis_start_time) * 1000
+                        tts_logger.info(f"⚡ FIRST AUDIO CHUNK: {first_chunk_latency:.1f}ms")
+
                     # ULTRA-FAST: Optimized tensor conversion
                     if hasattr(audio, 'cpu'):  # PyTorch tensor
                         # Use non-blocking transfer for speed
@@ -284,28 +291,32 @@ class KokoroTTSModel:
                     # ULTRA-FAST: Direct conversion without intermediate steps
                     audio_bytes = (audio_np * 32767).astype(np.int16).tobytes()
                     chunk_count += 1
+                    total_audio_bytes += len(audio_bytes)
 
-                    # Collect chunks for batch processing
-                    audio_chunks.append(audio_bytes)
+                    # ✅ YIELD IMMEDIATELY - No batching, no collection
+                    yield {
+                        'audio_chunk': audio_bytes,
+                        'chunk_index': i,
+                        'is_final': False,
+                        'sample_rate': self.sample_rate,
+                        'voice': voice,  # Include voice for consistency tracking
+                        'chunk_id': f"{chunk_id}_audio_{i}",
+                        'chunk_size_bytes': len(audio_bytes),
+                        'timestamp': time.time()
+                    }
 
-            # ULTRA-LOW LATENCY: Batch yield all chunks at once for maximum speed
-            if audio_chunks:
-                # Combine all chunks into single audio output
-                combined_audio = b''.join(audio_chunks)
+                    # Minimal delay for async coordination
+                    await asyncio.sleep(0.001)
 
-                # Single yield for ultra-low latency
-                yield {
-                    'audio_chunk': combined_audio,
-                    'chunk_index': 0,
-                    'is_final': False,
-                    'sample_rate': self.sample_rate
-                }
-
-                # Minimal logging
-                tts_logger.debug(f"🎵 Combined {len(audio_chunks)} chunks: {len(combined_audio)} bytes")
+                    tts_logger.debug(f"🎵 Yielded audio chunk {i}: {len(audio_bytes)} bytes")
 
             synthesis_time = (time.time() - synthesis_start_time) * 1000
-            tts_logger.info(f"✅ Streaming synthesis completed in {synthesis_time:.1f}ms ({chunk_count} chunks)")
+            first_chunk_latency_ms = (first_chunk_time - synthesis_start_time) * 1000 if first_chunk_time else 0
+
+            tts_logger.info(f"✅ TRUE STREAMING synthesis completed in {synthesis_time:.1f}ms")
+            tts_logger.info(f"   ⚡ First chunk: {first_chunk_latency_ms:.1f}ms")
+            tts_logger.info(f"   🔢 Total chunks: {chunk_count}")
+            tts_logger.info(f"   📊 Total audio: {total_audio_bytes} bytes")
 
             # Send final chunk marker
             yield {
@@ -313,7 +324,10 @@ class KokoroTTSModel:
                 'chunk_index': chunk_count,
                 'is_final': True,
                 'synthesis_time_ms': synthesis_time,
-                'total_chunks': chunk_count
+                'first_chunk_latency_ms': first_chunk_latency_ms,
+                'total_chunks': chunk_count,
+                'total_audio_bytes': total_audio_bytes,
+                'voice': voice
             }
 
         except Exception as e:
