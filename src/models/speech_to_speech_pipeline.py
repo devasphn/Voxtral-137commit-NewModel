@@ -76,7 +76,207 @@ class SpeechToSpeechPipeline:
             pipeline_logger.error(f"❌ Failed to initialize Speech-to-Speech pipeline: {e}")
             raise
     
-    async def process_conversation_turn(self, audio_data: np.ndarray, 
+    async def process_conversation_turn_chunked_streaming(self, audio_data: np.ndarray,
+                                                        conversation_id: str = None,
+                                                        voice_preference: str = None,
+                                                        speed_preference: float = None) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Process a complete conversation turn with CHUNKED STREAMING for sub-500ms latency
+        Speech Input → Chunked Text Generation → Immediate TTS → Streaming Audio Output
+
+        Args:
+            audio_data: Input audio data from user
+            conversation_id: Unique conversation identifier
+            voice_preference: Preferred TTS voice
+            speed_preference: Preferred TTS speed
+
+        Yields:
+            Dict containing streaming chunks with audio data, text, and metadata
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Pipeline not initialized. Call initialize() first.")
+
+        turn_start_time = time.time()
+        conversation_id = conversation_id or f"conv_chunked_{int(time.time() * 1000)}"
+        self.total_conversations += 1
+
+        pipeline_logger.info(f"🚀 Processing CHUNKED STREAMING conversation turn {conversation_id}")
+
+        try:
+            # Stage 1: Audio preprocessing and validation
+            preprocessing_start = time.time()
+
+            if not self.audio_processor.validate_realtime_chunk(audio_data, chunk_id=conversation_id):
+                # Early return for silence
+                yield {
+                    'type': 'complete',
+                    'conversation_id': conversation_id,
+                    'transcription': '',
+                    'response_text': '',
+                    'total_latency_ms': (time.time() - turn_start_time) * 1000,
+                    'success': True,
+                    'is_silence': True
+                }
+                return
+
+            # Preprocess audio
+            audio_tensor = self.audio_processor.preprocess_realtime_chunk(
+                audio_data,
+                chunk_id=conversation_id
+            )
+
+            preprocessing_time = (time.time() - preprocessing_start) * 1000
+            pipeline_logger.debug(f"⚡ Audio preprocessing: {preprocessing_time:.1f}ms")
+
+            # Stage 2: CHUNKED STREAMING Speech-to-Text and Response Generation
+            stt_start_time = time.time()
+            first_chunk_time = None
+            first_audio_time = None
+            transcription_parts = []
+            response_parts = []
+            chunk_count = 0
+
+            # Process with Voxtral chunked streaming
+            async for chunk_data in voxtral_model.process_chunked_streaming(
+                audio_tensor,
+                prompt=None,
+                chunk_id=conversation_id,
+                mode="chunked_streaming"
+            ):
+                if chunk_data.get('type') == 'semantic_chunk':
+                    chunk_text = chunk_data.get('text', '').strip()
+
+                    if chunk_text:
+                        if first_chunk_time is None:
+                            first_chunk_time = time.time()
+                            first_chunk_latency = (first_chunk_time - turn_start_time) * 1000
+                            pipeline_logger.info(f"⚡ First semantic chunk ready in {first_chunk_latency:.1f}ms: '{chunk_text}'")
+
+                        response_parts.append(chunk_text)
+                        chunk_count += 1
+
+                        # Yield text chunk immediately
+                        yield {
+                            'type': 'text_chunk',
+                            'conversation_id': conversation_id,
+                            'text': chunk_text,
+                            'chunk_sequence': chunk_count,
+                            'boundary_type': chunk_data.get('boundary_type', 'unknown'),
+                            'confidence': chunk_data.get('confidence', 0.0),
+                            'generation_time_ms': chunk_data.get('generation_time_ms', 0),
+                            'timestamp': time.time()
+                        }
+
+                        # Stage 3: IMMEDIATE TTS Processing for this chunk
+                        tts_start_time = time.time()
+                        voice = voice_preference or 'af_heart'
+
+                        try:
+                            # Generate TTS for this semantic chunk immediately
+                            async for tts_chunk in kokoro_model.synthesize_speech_streaming(
+                                chunk_text,
+                                voice=voice,
+                                chunk_id=f"{conversation_id}_chunk_{chunk_count}"
+                            ):
+                                if tts_chunk.get('audio_chunk') is not None:
+                                    if first_audio_time is None:
+                                        first_audio_time = time.time()
+                                        first_audio_latency = (first_audio_time - turn_start_time) * 1000
+                                        pipeline_logger.info(f"🎵 First audio chunk ready in {first_audio_latency:.1f}ms")
+
+                                    # Yield audio chunk immediately for playback
+                                    yield {
+                                        'type': 'audio_chunk',
+                                        'conversation_id': conversation_id,
+                                        'audio_data': tts_chunk['audio_chunk'],
+                                        'sample_rate': tts_chunk.get('sample_rate', 24000),
+                                        'chunk_sequence': chunk_count,
+                                        'text_source': chunk_text,
+                                        'chunk_index': tts_chunk.get('chunk_index', 0),
+                                        'is_final_audio': tts_chunk.get('is_final', False),
+                                        'synthesis_time_ms': tts_chunk.get('synthesis_time_ms', 0),
+                                        'timestamp': time.time()
+                                    }
+
+                                elif tts_chunk.get('is_final'):
+                                    tts_time = (time.time() - tts_start_time) * 1000
+                                    pipeline_logger.debug(f"✅ TTS chunk {chunk_count} completed in {tts_time:.1f}ms")
+
+                        except Exception as tts_error:
+                            pipeline_logger.error(f"❌ TTS error for chunk '{chunk_text}': {tts_error}")
+                            yield {
+                                'type': 'error',
+                                'conversation_id': conversation_id,
+                                'error': f"TTS error: {str(tts_error)}",
+                                'chunk_sequence': chunk_count,
+                                'text_source': chunk_text
+                            }
+
+                elif chunk_data.get('type') == 'complete':
+                    # Voxtral generation complete
+                    stt_time = (time.time() - stt_start_time) * 1000
+                    full_response = ' '.join(response_parts)
+
+                    pipeline_logger.info(f"✅ Chunked streaming completed: {chunk_count} chunks in {stt_time:.1f}ms")
+                    pipeline_logger.info(f"📝 Full response: '{full_response}'")
+                    break
+
+                elif chunk_data.get('type') == 'error':
+                    pipeline_logger.error(f"❌ Voxtral chunked streaming error: {chunk_data.get('error')}")
+                    yield {
+                        'type': 'error',
+                        'conversation_id': conversation_id,
+                        'error': f"Voxtral error: {chunk_data.get('error')}",
+                        'stage': 'speech_to_text'
+                    }
+                    return
+
+            # Final completion
+            total_time = (time.time() - turn_start_time) * 1000
+            full_response = ' '.join(response_parts)
+
+            yield {
+                'type': 'complete',
+                'conversation_id': conversation_id,
+                'transcription': full_response,  # In this case, response is the transcription
+                'response_text': full_response,
+                'total_chunks': chunk_count,
+                'total_latency_ms': total_time,
+                'first_chunk_latency_ms': (first_chunk_time - turn_start_time) * 1000 if first_chunk_time else 0,
+                'first_audio_latency_ms': (first_audio_time - turn_start_time) * 1000 if first_audio_time else 0,
+                'success': True,
+                'stage_timings': {
+                    'preprocessing_ms': preprocessing_time,
+                    'total_stt_ms': stt_time if 'stt_time' in locals() else 0,
+                    'total_pipeline_ms': total_time
+                }
+            }
+
+            # Update pipeline history
+            self.pipeline_history.append({
+                'conversation_id': conversation_id,
+                'total_latency_ms': total_time,
+                'first_chunk_latency_ms': (first_chunk_time - turn_start_time) * 1000 if first_chunk_time else 0,
+                'first_audio_latency_ms': (first_audio_time - turn_start_time) * 1000 if first_audio_time else 0,
+                'chunks_generated': chunk_count,
+                'success': True,
+                'timestamp': time.time()
+            })
+
+        except Exception as e:
+            pipeline_logger.error(f"❌ Chunked streaming pipeline error for {conversation_id}: {e}")
+            import traceback
+            pipeline_logger.error(f"❌ Full traceback: {traceback.format_exc()}")
+
+            yield {
+                'type': 'error',
+                'conversation_id': conversation_id,
+                'error': str(e),
+                'total_latency_ms': (time.time() - turn_start_time) * 1000,
+                'success': False
+            }
+
+    async def process_conversation_turn(self, audio_data: np.ndarray,
                                       conversation_id: str = None,
                                       voice_preference: str = None,
                                       speed_preference: float = None) -> Dict[str, Any]:

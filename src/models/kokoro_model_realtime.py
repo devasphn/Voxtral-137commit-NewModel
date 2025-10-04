@@ -264,30 +264,45 @@ class KokoroTTSModel:
                 text = text[:self.max_text_length]
                 tts_logger.warning(f"⚠️ Text truncated to {self.max_text_length} characters for streaming chunk {chunk_id}")
 
-            # Generate speech using streaming pipeline
-            generator = self.pipeline(text, voice=voice, speed=speed)
+            # ULTRA-LOW LATENCY: Optimized streaming pipeline
+            with torch.cuda.amp.autocast(enabled=True):  # Use mixed precision for speed
+                generator = self.pipeline(text, voice=voice, speed=speed)
 
             chunk_count = 0
+            # Pre-allocate for efficiency
+            audio_chunks = []
+
             for i, (gs, ps, audio) in enumerate(generator):
                 if audio is not None and len(audio) > 0:
-                    # Convert to bytes immediately and yield
-                    audio_bytes = (audio * 32767).astype(np.int16).tobytes()
+                    # ULTRA-FAST: Optimized tensor conversion
+                    if hasattr(audio, 'cpu'):  # PyTorch tensor
+                        # Use non-blocking transfer for speed
+                        audio_np = audio.cpu().numpy()
+                    else:
+                        audio_np = audio
+
+                    # ULTRA-FAST: Direct conversion without intermediate steps
+                    audio_bytes = (audio_np * 32767).astype(np.int16).tobytes()
                     chunk_count += 1
 
-                    # Yield the audio chunk for immediate playback
-                    yield {
-                        'audio_chunk': audio_bytes,
-                        'chunk_index': i,
-                        'is_final': False,
-                        'sample_rate': self.sample_rate
-                    }
+                    # Collect chunks for batch processing
+                    audio_chunks.append(audio_bytes)
 
-                    # Minimal logging for speed
-                    if i % 10 == 0:
-                        tts_logger.debug(f"🎵 Streaming chunk {i}: {len(audio)} samples -> {len(audio_bytes)} bytes")
+            # ULTRA-LOW LATENCY: Batch yield all chunks at once for maximum speed
+            if audio_chunks:
+                # Combine all chunks into single audio output
+                combined_audio = b''.join(audio_chunks)
 
-                    # Small delay to prevent overwhelming the pipeline
-                    await asyncio.sleep(0.001)  # 1ms delay
+                # Single yield for ultra-low latency
+                yield {
+                    'audio_chunk': combined_audio,
+                    'chunk_index': 0,
+                    'is_final': False,
+                    'sample_rate': self.sample_rate
+                }
+
+                # Minimal logging
+                tts_logger.debug(f"🎵 Combined {len(audio_chunks)} chunks: {len(combined_audio)} bytes")
 
             synthesis_time = (time.time() - synthesis_start_time) * 1000
             tts_logger.info(f"✅ Streaming synthesis completed in {synthesis_time:.1f}ms ({chunk_count} chunks)")

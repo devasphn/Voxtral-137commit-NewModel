@@ -84,6 +84,121 @@ class StreamingCoordinator:
         streaming_logger.info(f"🎙️ Started streaming session: {session_id}")
         return session_id
     
+    async def process_chunked_stream(self, voxtral_stream: AsyncGenerator) -> AsyncGenerator[StreamingChunk, None]:
+        """
+        Process semantic chunks from Voxtral for ultra-low latency TTS generation
+        Optimized for sub-500ms latency with immediate chunk processing
+        """
+        if self.state != StreamingState.LISTENING:
+            streaming_logger.warning(f"⚠️ Cannot process chunked stream in state: {self.state}")
+            return
+
+        self.state = StreamingState.PROCESSING
+        session_start_time = time.time()
+        first_chunk_sent = False
+        chunks_sent_count = 0
+
+        try:
+            async for chunk_data in voxtral_stream:
+                # Check for interruption
+                if self.interruption_detected:
+                    streaming_logger.info(f"🛑 Chunked stream interrupted for session {self.current_session_id}")
+                    yield StreamingChunk(
+                        type='interrupted',
+                        content={'reason': 'user_interruption'},
+                        timestamp=time.time(),
+                        chunk_id=self.current_session_id
+                    )
+                    break
+
+                # Handle semantic chunks
+                if chunk_data.get('type') == 'semantic_chunk':
+                    chunk_text = chunk_data.get('text', '').strip()
+
+                    if chunk_text:
+                        # Track first chunk latency
+                        if not first_chunk_sent:
+                            first_chunk_latency = (time.time() - session_start_time) * 1000
+                            self.performance_metrics['first_word_latency'].append(first_chunk_latency)
+                            first_chunk_sent = True
+                            streaming_logger.info(f"⚡ First semantic chunk ready in {first_chunk_latency:.1f}ms: '{chunk_text}'")
+
+                        # Create streaming chunk for immediate TTS processing
+                        streaming_chunk = StreamingChunk(
+                            type='semantic_chunk_ready',
+                            content={
+                                'text': chunk_text,
+                                'word_count': chunk_data.get('word_count', 0),
+                                'boundary_type': chunk_data.get('boundary_type', 'unknown'),
+                                'confidence': chunk_data.get('confidence', 0.0),
+                                'generation_time_ms': chunk_data.get('generation_time_ms', 0),
+                                'sequence_number': chunks_sent_count
+                            },
+                            timestamp=time.time(),
+                            chunk_id=f"{self.current_session_id}_chunk_{chunks_sent_count}",
+                            metadata={
+                                'session_id': self.current_session_id,
+                                'is_first_chunk': not first_chunk_sent,
+                                'total_chunks_sent': chunks_sent_count,
+                                'original_chunk_id': chunk_data.get('chunk_id')
+                            }
+                        )
+
+                        chunks_sent_count += 1
+                        yield streaming_chunk
+
+                        # Trigger TTS generation asynchronously for immediate processing
+                        if self.on_words_ready:
+                            asyncio.create_task(self.on_words_ready(streaming_chunk))
+
+                        streaming_logger.debug(f"🎯 Semantic chunk processed: '{chunk_text}' "
+                                             f"({chunk_data.get('boundary_type')}, {chunks_sent_count} chunks)")
+
+                # Handle completion
+                elif chunk_data.get('type') == 'complete':
+                    total_session_time = (time.time() - session_start_time) * 1000
+                    self.performance_metrics['total_session_latency'].append(total_session_time)
+
+                    yield StreamingChunk(
+                        type='session_complete',
+                        content={
+                            'total_chunks': chunks_sent_count,
+                            'total_time_ms': total_session_time,
+                            'inference_time_ms': chunk_data.get('inference_time_ms', 0),
+                            'response_text': chunk_data.get('response_text', ''),
+                            'total_tokens': chunk_data.get('total_tokens', 0)
+                        },
+                        timestamp=time.time(),
+                        chunk_id=self.current_session_id,
+                        metadata={'session_id': self.current_session_id}
+                    )
+
+                    streaming_logger.info(f"✅ Chunked session completed: {chunks_sent_count} chunks in {total_session_time:.1f}ms")
+                    break
+
+                # Handle errors
+                elif chunk_data.get('type') == 'error':
+                    streaming_logger.error(f"❌ Chunked streaming error: {chunk_data.get('error')}")
+                    yield StreamingChunk(
+                        type='error',
+                        content={'error': chunk_data.get('error', 'Unknown error')},
+                        timestamp=time.time(),
+                        chunk_id=self.current_session_id
+                    )
+                    break
+
+        except Exception as e:
+            streaming_logger.error(f"❌ Error in chunked stream processing: {e}")
+            yield StreamingChunk(
+                type='error',
+                content={'error': str(e)},
+                timestamp=time.time(),
+                chunk_id=self.current_session_id
+            )
+
+        finally:
+            self.state = StreamingState.IDLE
+
     async def process_voxtral_stream(self, voxtral_stream: AsyncGenerator) -> AsyncGenerator[StreamingChunk, None]:
         """
         Process streaming tokens from Voxtral and coordinate TTS generation
@@ -91,7 +206,7 @@ class StreamingCoordinator:
         if self.state != StreamingState.LISTENING:
             streaming_logger.warning(f"⚠️ Cannot process stream in state: {self.state}")
             return
-        
+
         self.state = StreamingState.PROCESSING
         session_start_time = time.time()
         first_word_sent = False

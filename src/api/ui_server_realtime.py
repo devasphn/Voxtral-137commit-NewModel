@@ -1619,7 +1619,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 if msg_type == "audio_chunk":
                     await handle_conversational_audio_chunk(websocket, message, client_id)
-                    
+
+                elif msg_type == "speech_to_speech":
+                    await handle_speech_to_speech_chunked_streaming(websocket, message, client_id)
+
                 elif msg_type == "ping":
                     await websocket.send_text(json.dumps({
                         "type": "pong", 
@@ -1687,6 +1690,269 @@ async def detect_user_interruption(audio_chunk: np.ndarray, current_state: str =
     except Exception as e:
         logger.error(f"❌ Interruption detection error: {e}")
         return False
+
+async def detect_interruption(websocket: WebSocket, client_id: str) -> bool:
+    """
+    ULTRA-FAST INTERRUPTION DETECTION (Target: <10ms)
+    Detects user interruption for immediate TTS cancellation
+    """
+    try:
+        # Ultra-fast message check with minimal timeout
+        try:
+            message = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+            data = json.loads(message)
+
+            # Check for interruption signals
+            msg_type = data.get("type", "")
+            if msg_type in ["audio_chunk", "speech_to_speech", "interrupt", "stop"]:
+                streaming_logger.info(f"🛑 Interruption detected: {msg_type}")
+                return True
+
+        except asyncio.TimeoutError:
+            # No interruption - continue streaming
+            pass
+        except Exception:
+            # Error - assume no interruption
+            pass
+
+        return False
+
+    except Exception as e:
+        streaming_logger.error(f"❌ Interruption detection error: {e}")
+        return False
+
+async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, message: dict, client_id: str):
+    """
+    ULTRA-LOW LATENCY TOKEN-BY-TOKEN STREAMING PIPELINE
+    Target: <100ms first token, <50ms inter-token, <100ms TTS
+    """
+    pipeline_start = time.time()
+
+    try:
+        # STEP 1: ULTRA-FAST MESSAGE PARSING (Target: <1ms)
+        audio_data_b64 = message.get("audio_data", "")
+        conversation_id = message.get("conversation_id", f"ultra_stream_{int(time.time() * 1000000)}")
+        voice_preference = message.get("voice", "af_heart")
+
+        if not audio_data_b64:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "No audio data provided",
+                "conversation_id": conversation_id
+            }))
+            return
+
+        streaming_logger.info(f"🚀 ULTRA-LOW LATENCY PIPELINE: {conversation_id}")
+
+        # STEP 2: ULTRA-FAST AUDIO DECODING (Target: <10ms)
+        decode_start = time.time()
+        try:
+            audio_bytes = base64.b64decode(audio_data_b64)
+
+            # Direct audio processing without file I/O
+            import io
+            import soundfile as sf
+            audio_buffer = io.BytesIO(audio_bytes)
+            audio_array, sample_rate = sf.read(audio_buffer)
+
+            # Fast format conversion
+            if audio_array.ndim > 1:
+                audio_array = audio_array.mean(axis=1)
+
+            # Fast resampling if needed
+            if sample_rate != 16000:
+                import librosa
+                audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+
+            audio_array = audio_array.astype(np.float32)
+
+            decode_time = (time.time() - decode_start) * 1000
+            streaming_logger.debug(f"⚡ Audio decode: {decode_time:.1f}ms")
+
+        except Exception as e:
+            streaming_logger.error(f"❌ Audio decoding error: {e}")
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": f"Audio decoding failed: {str(e)}",
+                "conversation_id": conversation_id
+            }))
+            return
+
+        # STEP 3: INITIALIZE STREAMING PIPELINE
+        unified_manager = get_unified_manager()
+
+        # Ensure models are available
+        if not unified_manager or not unified_manager.voxtral_model or not unified_manager.kokoro_model:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "Models not initialized",
+                "conversation_id": conversation_id
+            }))
+            return
+
+        # STEP 4: ULTRA-LOW LATENCY TOKEN-BY-TOKEN STREAMING
+        streaming_start = time.time()
+        full_response = ""
+        word_count = 0
+        token_count = 0
+        first_token_sent = False
+        first_word_sent = False
+
+        # Track performance metrics
+        first_token_time = None
+        first_word_time = None
+
+        # Initialize interruption detection
+        interruption_detected = False
+
+        try:
+            # Start TRUE token-by-token streaming with new method
+            async for chunk_data in unified_manager.voxtral_model.process_chunked_streaming(
+                audio_array,
+                prompt=None,
+                chunk_id=conversation_id,
+                mode="chunked_streaming"
+            ):
+                current_time = time.time()
+                chunk_type = chunk_data.get('type')
+
+                # Check for interruption
+                if await detect_interruption(websocket, client_id):
+                    interruption_detected = True
+                    streaming_logger.info(f"🛑 Interruption detected for {conversation_id}")
+                    break
+
+                if chunk_type == 'token_chunk':
+                    token_count += 1
+                    token_text = chunk_data.get('text', '')
+
+                    # Track first token timing
+                    if not first_token_sent:
+                        first_token_time = current_time
+                        first_token_latency = (first_token_time - streaming_start) * 1000
+                        first_token_sent = True
+                        streaming_logger.info(f"⚡ FIRST TOKEN: {first_token_latency:.1f}ms")
+
+                    # Send token immediately for ultra-low latency
+                    await websocket.send_text(json.dumps({
+                        "type": "token_chunk",
+                        "conversation_id": conversation_id,
+                        "text": token_text,
+                        "chunk_sequence": token_count,
+                        "generation_time_ms": chunk_data.get('generation_time_ms', 0),
+                        "timestamp": current_time
+                    }))
+
+                elif chunk_type == 'semantic_chunk':
+                    word_count += 1
+                    chunk_text = chunk_data.get('text', '').strip()
+
+                    if chunk_text:
+                        full_response += " " + chunk_text
+
+                        # Track first word timing
+                        if not first_word_sent:
+                            first_word_time = current_time
+                            first_word_latency = (first_word_time - streaming_start) * 1000
+                            first_word_sent = True
+                            streaming_logger.info(f"📝 FIRST WORD: {first_word_latency:.1f}ms")
+
+                        # Send semantic chunk
+                        await websocket.send_text(json.dumps({
+                            "type": "semantic_chunk",
+                            "conversation_id": conversation_id,
+                            "text": chunk_text,
+                            "full_text_so_far": full_response.strip(),
+                            "chunk_sequence": word_count,
+                            "boundary_type": chunk_data.get('boundary_type', 'word'),
+                            "confidence": chunk_data.get('confidence', 1.0),
+                            "generation_time_ms": chunk_data.get('generation_time_ms', 0),
+                            "timestamp": current_time
+                        }))
+
+                        # STEP 5: ULTRA-FAST TTS SYNTHESIS (Target: <50ms)
+                        tts_start = time.time()
+                        try:
+                            async for tts_chunk in unified_manager.kokoro_model.synthesize_speech_streaming(
+                                chunk_text,
+                                voice=voice_preference,
+                                chunk_id=f"{conversation_id}_word_{word_count}"
+                            ):
+                                if tts_chunk.get('audio_chunk') is not None:
+                                    audio_data = tts_chunk['audio_chunk']
+
+                                    # Fast audio encoding
+                                    if isinstance(audio_data, bytes):
+                                        audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+                                    else:
+                                        audio_bytes = audio_data.astype(np.int16).tobytes()
+                                        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+                                    tts_time = (time.time() - tts_start) * 1000
+
+                                    # Send audio immediately
+                                    await websocket.send_text(json.dumps({
+                                        "type": "chunked_streaming_audio",
+                                        "conversation_id": conversation_id,
+                                        "audio_data": audio_b64,
+                                        "sample_rate": tts_chunk.get('sample_rate', 24000),
+                                        "chunk_sequence": word_count,
+                                        "text_source": chunk_text,
+                                        "synthesis_time_ms": tts_time,
+                                        "is_final_audio": tts_chunk.get('is_final', False),
+                                        "timestamp": time.time()
+                                    }))
+
+                        except Exception as tts_error:
+                            streaming_logger.error(f"❌ TTS error for '{chunk_text}': {tts_error}")
+                            # Continue processing even if TTS fails
+
+                elif chunk_type == 'chunked_streaming_complete':
+                    # Calculate final metrics
+                    total_time = (time.time() - pipeline_start) * 1000
+
+                    # Send final completion with performance metrics
+                    await websocket.send_text(json.dumps({
+                        "type": "chunked_streaming_complete",
+                        "conversation_id": conversation_id,
+                        "response_text": full_response.strip(),
+                        "total_tokens": token_count,
+                        "total_words": word_count,
+                        "total_time_ms": total_time,
+                        "first_token_latency_ms": chunk_data.get('first_token_latency_ms', 0),
+                        "first_word_latency_ms": chunk_data.get('first_word_latency_ms', 0),
+                        "streaming_method": "TokenByTokenStreaming",
+                        "interruption_detected": interruption_detected,
+                        "success": True,
+                        "timestamp": time.time()
+                    }))
+
+                    # Log final performance metrics
+                    streaming_logger.info(f"✅ ULTRA-LOW LATENCY COMPLETE: {conversation_id}")
+                    streaming_logger.info(f"   ⚡ Total time: {total_time:.1f}ms")
+                    streaming_logger.info(f"   🔤 Tokens: {token_count}")
+                    streaming_logger.info(f"   📝 Words: {word_count}")
+                    if first_token_time:
+                        streaming_logger.info(f"   ⚡ First token: {(first_token_time - streaming_start) * 1000:.1f}ms")
+                    if first_word_time:
+                        streaming_logger.info(f"   📝 First word: {(first_word_time - streaming_start) * 1000:.1f}ms")
+                    break
+
+        except Exception as streaming_error:
+            streaming_logger.error(f"❌ Streaming error: {streaming_error}")
+            import traceback
+            traceback.print_exc()
+
+    except Exception as e:
+        streaming_logger.error(f"❌ Pipeline error for {client_id}: {e}")
+        import traceback
+        streaming_logger.error(f"❌ Traceback: {traceback.format_exc()}")
+
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": f"Ultra-low latency pipeline failed: {str(e)}",
+            "conversation_id": conversation_id
+        }))
 
 async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, client_id: str):
     """Process conversational audio chunks with VAD using unified model manager"""
@@ -1782,58 +2048,66 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                     }))
                     return
 
-                # Process with streaming Voxtral
-                voxtral_stream = voxtral_model.process_streaming_chunk(
+                # Process with chunked streaming Voxtral for sub-500ms latency
+                voxtral_stream = voxtral_model.process_chunked_streaming(
                     audio_array,
                     prompt=prompt,
                     chunk_id=chunk_id,
-                    mode="streaming"
+                    mode="chunked_streaming"
                 )
 
-                # Process streaming tokens and coordinate TTS
+                # Process semantic chunks and coordinate immediate TTS
                 full_response = ""
-                words_sent_for_tts = []
+                chunks_sent_for_tts = []
 
-                async for stream_chunk in streaming_coordinator.process_voxtral_stream(voxtral_stream):
-                    if stream_chunk.type == 'words_ready':
-                        words_text = stream_chunk.content['text']
-                        full_response += " " + words_text
-                        words_sent_for_tts.append(words_text)
+                async for stream_chunk in streaming_coordinator.process_chunked_stream(voxtral_stream):
+                    if stream_chunk.type == 'semantic_chunk_ready':
+                        chunk_text = stream_chunk.content['text']
+                        full_response += " " + chunk_text
+                        chunks_sent_for_tts.append(chunk_text)
 
-                        # Send words to client immediately
+                        # Send semantic chunk to client immediately
                         await websocket.send_text(json.dumps({
-                            "type": "streaming_words",
-                            "text": words_text,
+                            "type": "semantic_chunk",
+                            "text": chunk_text,
                             "full_text_so_far": full_response.strip(),
                             "chunk_id": chunk_id,
                             "sequence": stream_chunk.content['sequence_number'],
+                            "boundary_type": stream_chunk.content['boundary_type'],
+                            "confidence": stream_chunk.content['confidence'],
+                            "word_count": stream_chunk.content['word_count'],
+                            "generation_time_ms": stream_chunk.content['generation_time_ms'],
                             "timestamp": time.time()
                         }))
 
-                        # Start TTS for these words immediately
+                        # Start TTS for semantic chunk immediately (parallel processing)
                         try:
-                            tts_timing_id = performance_monitor.start_timing("kokoro_streaming", {
+                            tts_timing_id = performance_monitor.start_timing("kokoro_chunked_streaming", {
                                 "chunk_id": f"{chunk_id}_tts_{stream_chunk.content['sequence_number']}",
-                                "text_length": len(words_text),
-                                "voice": "hm_omega"
+                                "text_length": len(chunk_text),
+                                "voice": "hm_omega",
+                                "boundary_type": stream_chunk.content['boundary_type'],
+                                "word_count": stream_chunk.content['word_count']
                             })
 
-                            # Generate TTS for words using streaming
+                            # Generate TTS for semantic chunk using streaming (immediate processing)
                             async for tts_chunk in kokoro_model.synthesize_speech_streaming(
-                                words_text,
+                                chunk_text,
                                 voice="hm_omega",
                                 chunk_id=f"{chunk_id}_tts_{stream_chunk.content['sequence_number']}"
                             ):
                                 if tts_chunk.get('audio_chunk'):
-                                    # Send audio chunk immediately
+                                    # Send audio chunk immediately (parallel processing)
                                     audio_b64 = base64.b64encode(tts_chunk['audio_chunk']).decode('utf-8')
                                     await websocket.send_text(json.dumps({
-                                        "type": "streaming_audio",
+                                        "type": "chunked_streaming_audio",
                                         "audio_data": audio_b64,
                                         "chunk_index": tts_chunk['chunk_index'],
                                         "is_final": tts_chunk['is_final'],
                                         "sample_rate": tts_chunk['sample_rate'],
-                                        "text_source": words_text,
+                                        "text_source": chunk_text,
+                                        "boundary_type": stream_chunk.content['boundary_type'],
+                                        "semantic_chunk_id": stream_chunk.content['sequence_number'],
                                         "timestamp": time.time()
                                     }))
 
@@ -1842,21 +2116,33 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                                     streaming_logger.info(f"✅ TTS chunk completed in {tts_time:.1f}ms")
 
                         except Exception as tts_error:
-                            streaming_logger.error(f"❌ TTS streaming error: {tts_error}")
+                            streaming_logger.error(f"❌ TTS error for chunk '{chunk_text}': {tts_error}")
+                            await websocket.send_text(json.dumps({
+                                "type": "tts_error",
+                                "error": str(tts_error),
+                                "text_source": chunk_text,
+                                "chunk_id": chunk_id,
+                                "boundary_type": stream_chunk.content['boundary_type']
+                            }))
 
                     elif stream_chunk.type == 'session_complete':
                         # End Voxtral timing
                         voxtral_processing_time = performance_monitor.end_timing(voxtral_timing_id)
 
-                        # Send completion
+                        # Send completion with chunked streaming stats
                         await websocket.send_text(json.dumps({
-                            "type": "streaming_complete",
+                            "type": "chunked_streaming_complete",
                             "full_response": full_response.strip(),
-                            "total_words_sent": len(words_sent_for_tts),
+                            "total_chunks_sent": len(chunks_sent_for_tts),
+                            "total_time_ms": stream_chunk.content.get('total_time_ms', 0),
+                            "inference_time_ms": stream_chunk.content.get('inference_time_ms', 0),
+                            "total_tokens": stream_chunk.content.get('total_tokens', 0),
                             "voxtral_time_ms": voxtral_processing_time,
                             "chunk_id": chunk_id,
                             "timestamp": time.time()
                         }))
+                        streaming_logger.info(f"✅ Chunked streaming session completed: {len(chunks_sent_for_tts)} semantic chunks sent "
+                                            f"in {stream_chunk.content.get('total_time_ms', 0):.1f}ms")
                         break
 
                     elif stream_chunk.type == 'error':

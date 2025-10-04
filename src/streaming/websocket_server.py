@@ -151,68 +151,89 @@ class WebSocketServer:
                 "message": "Converting speech to text..."
             })
 
-            # Process through speech-to-speech pipeline
-            result = await speech_to_speech_pipeline.process_conversation_turn(
+            # Process through CHUNKED STREAMING speech-to-speech pipeline
+            full_transcription = ""
+            full_response = ""
+            chunk_count = 0
+
+            async for chunk_data in speech_to_speech_pipeline.process_conversation_turn_chunked_streaming(
                 audio_array,
                 conversation_id=conversation_id,
                 voice_preference=voice_preference,
                 speed_preference=speed_preference
-            )
+            ):
+                chunk_type = chunk_data.get('type')
 
-            if not result['success']:
-                await self.send_message(websocket, {
-                    "type": "error",
-                    "conversation_id": conversation_id,
-                    "message": f"Speech-to-speech processing failed: {result.get('error', 'Unknown error')}"
-                })
-                return
+                if chunk_type == 'text_chunk':
+                    # Send text chunk immediately
+                    chunk_text = chunk_data.get('text', '')
+                    full_response += " " + chunk_text
+                    chunk_count += 1
 
-            # Send transcription update
-            if result['transcription']:
-                await self.send_message(websocket, {
-                    "type": "transcription",
-                    "conversation_id": conversation_id,
-                    "text": result['transcription'],
-                    "stage_timing_ms": result['stage_timings'].get('stt_ms', 0)
-                })
+                    await self.send_message(websocket, {
+                        "type": "semantic_chunk",
+                        "conversation_id": conversation_id,
+                        "text": chunk_text,
+                        "full_text_so_far": full_response.strip(),
+                        "chunk_sequence": chunk_data.get('chunk_sequence', chunk_count),
+                        "boundary_type": chunk_data.get('boundary_type', 'unknown'),
+                        "confidence": chunk_data.get('confidence', 0.0),
+                        "generation_time_ms": chunk_data.get('generation_time_ms', 0),
+                        "timestamp": chunk_data.get('timestamp', time.time())
+                    })
 
-            # Send response text
-            if result['response_text']:
-                await self.send_message(websocket, {
-                    "type": "response_text",
-                    "conversation_id": conversation_id,
-                    "text": result['response_text'],
-                    "stage_timing_ms": result['stage_timings'].get('llm_ms', 0)
-                })
+                elif chunk_type == 'audio_chunk':
+                    # Send audio chunk immediately for playback
+                    audio_data = chunk_data.get('audio_data')
+                    if audio_data is not None:
+                        # Convert audio to base64 for transmission
+                        audio_bytes = audio_data.astype(np.float32).tobytes()
+                        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
 
-            # Send audio response if available
-            if len(result['response_audio']) > 0:
-                # Convert audio to base64 for transmission
-                audio_bytes = result['response_audio'].astype(np.float32).tobytes()
-                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                        await self.send_message(websocket, {
+                            "type": "chunked_streaming_audio",
+                            "conversation_id": conversation_id,
+                            "audio_data": audio_b64,
+                            "sample_rate": chunk_data.get('sample_rate', 24000),
+                            "chunk_sequence": chunk_data.get('chunk_sequence', 0),
+                            "text_source": chunk_data.get('text_source', ''),
+                            "chunk_index": chunk_data.get('chunk_index', 0),
+                            "is_final_audio": chunk_data.get('is_final_audio', False),
+                            "synthesis_time_ms": chunk_data.get('synthesis_time_ms', 0),
+                            "timestamp": chunk_data.get('timestamp', time.time())
+                        })
 
-                await self.send_message(websocket, {
-                    "type": "speech_response",
-                    "conversation_id": conversation_id,
-                    "audio_data": audio_b64,
-                    "sample_rate": result['sample_rate'],
-                    "voice_used": result.get('voice_used', 'unknown'),
-                    "speed_used": result.get('speed_used', 1.0),
-                    "audio_duration_s": len(result['response_audio']) / result['sample_rate'],
-                    "stage_timing_ms": result['stage_timings'].get('tts_ms', 0)
-                })
+                elif chunk_type == 'complete':
+                    # Send final completion
+                    full_transcription = chunk_data.get('transcription', full_response)
 
-            # Send final summary
-            await self.send_message(websocket, {
-                "type": "conversation_complete",
-                "conversation_id": conversation_id,
-                "total_latency_ms": result['total_latency_ms'],
-                "meets_target": result['total_latency_ms'] <= config.speech_to_speech.latency_target_ms,
-                "stage_timings": result['stage_timings'],
-                "is_silence": result.get('is_silence', False)
-            })
+                    await self.send_message(websocket, {
+                        "type": "chunked_streaming_complete",
+                        "conversation_id": conversation_id,
+                        "transcription": full_transcription,
+                        "response_text": full_response.strip(),
+                        "total_chunks": chunk_data.get('total_chunks', chunk_count),
+                        "total_latency_ms": chunk_data.get('total_latency_ms', 0),
+                        "first_chunk_latency_ms": chunk_data.get('first_chunk_latency_ms', 0),
+                        "first_audio_latency_ms": chunk_data.get('first_audio_latency_ms', 0),
+                        "stage_timings": chunk_data.get('stage_timings', {}),
+                        "success": True
+                    })
+                    break
 
-            logger.info(f"✅ Speech-to-speech conversation {conversation_id} completed in {result['total_latency_ms']:.1f}ms")
+                elif chunk_type == 'error':
+                    # Send error message
+                    await self.send_message(websocket, {
+                        "type": "error",
+                        "conversation_id": conversation_id,
+                        "message": f"Chunked streaming error: {chunk_data.get('error', 'Unknown error')}",
+                        "stage": chunk_data.get('stage', 'unknown')
+                    })
+                    return
+
+            processing_time = time.time() - start_time
+            logger.info(f"✅ Chunked streaming speech-to-speech completed in {processing_time:.2f}s "
+                       f"({chunk_count} chunks)")
 
             # Update health check status with latest performance
             try:

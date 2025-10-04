@@ -20,6 +20,9 @@ import logging
 from threading import Lock
 import base64
 
+# Import semantic chunking utility
+from src.utils.semantic_chunking import semantic_chunker, SemanticChunk
+
 # NOTE: mistral_common imports removed - using standard Hugging Face VoxtralProcessor API
 # The official VoxtralProcessor uses standard conversation format, not mistral_common classes
 import tempfile
@@ -87,7 +90,12 @@ class VoxtralModel:
         self.use_gradient_checkpointing = False  # DISABLED: Not needed for inference
         self.use_scaled_dot_product_attention = True  # ENABLED: PyTorch 2.0+ optimization
         self.enable_gpu_memory_optimization = True  # ENABLED: GPU memory optimizations
-        
+
+        # ULTRA-LOW LATENCY: Caching for repeated operations
+        self._processor_cache = {}
+        self._attention_cache = {}
+        self._generation_cache = {}
+
         realtime_logger.info(f"VoxtralModel initialized for {self.device} with {self.torch_dtype}")
         
     def get_audio_processor(self):
@@ -401,14 +409,16 @@ class VoxtralModel:
                 # Optimize generation config for speed
                 self.model.generation_config.use_cache = True
                 self.model.generation_config.pad_token_id = self.processor.tokenizer.eos_token_id
-                # ULTRA-OPTIMIZED generation parameters for sub-100ms target
-                self.model.generation_config.do_sample = False  # Greedy decoding for speed
-                self.model.generation_config.temperature = 0.01  # Minimal temperature for speed
-                self.model.generation_config.top_p = 0.7  # More focused sampling
-                self.model.generation_config.top_k = 15  # Reduced vocabulary for speed
-                self.model.generation_config.repetition_penalty = 1.3  # Higher penalty for concise responses
+                # ULTRA-OPTIMIZED generation parameters for sub-50ms target
+                self.model.generation_config.do_sample = False  # Greedy decoding for maximum speed
+                self.model.generation_config.temperature = 0.0  # No temperature for maximum speed
+                self.model.generation_config.top_p = 1.0  # No top-p filtering for speed
+                self.model.generation_config.top_k = 1  # Greedy selection only
+                self.model.generation_config.repetition_penalty = 1.0  # No penalty overhead
                 self.model.generation_config.num_beams = 1  # No beam search for speed
-                self.model.generation_config.early_stopping = True  # Stop early when possible
+                self.model.generation_config.early_stopping = False  # No early stopping overhead
+                self.model.generation_config.max_new_tokens = 150  # Allow complete sentences
+                self.model.generation_config.min_new_tokens = 1  # Allow single token responses
                 realtime_logger.info("✅ Generation config optimized for ultra-low latency")
 
             # ULTRA-LOW LATENCY: Enable PyTorch 2.0+ optimizations
@@ -436,13 +446,86 @@ class VoxtralModel:
             self.is_initialized = True
             init_time = time.time() - start_time
             realtime_logger.info(f"🎉 Voxtral model fully initialized in {init_time:.2f}s and ready for conversation!")
+
+            # COLD-START OPTIMIZATION: Pre-warm the model with dummy inference
+            await self._prewarm_model()
             
         except Exception as e:
             realtime_logger.error(f"❌ Failed to initialize Voxtral model: {e}")
             import traceback
             realtime_logger.error(f"❌ Full error traceback: {traceback.format_exc()}")
             raise
-    
+
+    async def _prewarm_model(self):
+        """
+        COLD-START OPTIMIZATION: Pre-warm the model with dummy inference to reduce first-request latency
+        """
+        try:
+            prewarm_start = time.time()
+            realtime_logger.info("🔥 Pre-warming model for optimal cold-start performance...")
+
+            # Create dummy audio input (1 second of silence)
+            dummy_audio = torch.zeros(16000, dtype=torch.float32)
+            if torch.cuda.is_available():
+                dummy_audio = dummy_audio.cuda()
+
+            # Create a temporary file for dummy audio
+            import tempfile
+            import soundfile as sf
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                sf.write(tmp_file.name, dummy_audio.cpu().numpy(), 16000)
+
+                # Create dummy conversation for pre-warming
+                dummy_conversation = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "audio", "path": tmp_file.name},
+                            {"type": "text", "text": "Hi"}
+                        ]
+                    }
+                ]
+
+                # Process dummy conversation to warm up the pipeline
+                dummy_inputs = self.processor.apply_chat_template(dummy_conversation, return_tensors="pt")
+
+                # Move to device
+                if torch.cuda.is_available():
+                    if hasattr(dummy_inputs, 'to'):
+                        dummy_inputs = dummy_inputs.to(self.device)
+                    elif isinstance(dummy_inputs, dict):
+                        dummy_inputs = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in dummy_inputs.items()}
+
+                # Warm up the model with a single forward pass
+                with torch.no_grad():
+                    # Use the uncompiled model for pre-warming to avoid compilation overhead
+                    model_to_use = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
+
+                    # Single forward pass to warm up CUDA kernels and memory allocation
+                    outputs = model_to_use(**dummy_inputs)
+
+                    # Warm up token generation
+                    dummy_logits = outputs.logits[0, -1, :]
+                    dummy_token = torch.argmax(dummy_logits, dim=-1, keepdim=True)
+
+                    # Warm up tokenizer
+                    if hasattr(self.processor, 'tokenizer'):
+                        dummy_text = self.processor.tokenizer.decode([dummy_token.item()], skip_special_tokens=True)
+
+                # Clean up temporary file
+                import os
+                os.unlink(tmp_file.name)
+
+            # Clear cache to free memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            prewarm_time = (time.time() - prewarm_start) * 1000
+            realtime_logger.info(f"🔥 Model pre-warming completed in {prewarm_time:.1f}ms - ready for ultra-low latency!")
+
+        except Exception as e:
+            realtime_logger.warning(f"⚠️ Model pre-warming failed: {e} - continuing without pre-warming")
+
     async def process_realtime_chunk(self, audio_data: torch.Tensor, chunk_id: int, mode: str = "conversation", prompt: str = "") -> Dict[str, Any]:
         """
         PRODUCTION-READY processing for conversational real-time audio chunks with VAD
@@ -506,7 +589,8 @@ class VoxtralModel:
                             realtime_logger.debug(f"🎙️ Using audio-only mode for speech-to-speech processing")
                         else:
                             # Audio + text mode for conversational AI
-                            conversation_prompt = prompt or "You are a helpful AI assistant in a natural voice conversation. Listen carefully to what the person is saying and respond naturally, as if you're having a friendly chat. Keep your responses conversational, concise (1-2 sentences), and engaging. Respond directly to what they said without repeating their words back to them."
+                            # OPTIMIZED: Friendly conversational prompt without markdown formatting
+                            conversation_prompt = prompt or "You are a helpful and friendly AI assistant. Respond naturally in conversation without using any markdown formatting, asterisks, or special characters. Keep responses conversational and complete but concise. Speak as if you're having a natural chat with a friend."
 
                             conversation = [
                                 {
@@ -566,19 +650,19 @@ class VoxtralModel:
                                         # ULTRA-LOW LATENCY: Maximum speed generation parameters for sub-50ms target
                                         outputs = self.model.generate(
                                             **inputs,
-                                            max_new_tokens=10,      # ULTRA-OPTIMIZED: Reduced to 10 tokens for maximum speed
-                                            min_new_tokens=1,       # ULTRA-REDUCED: Minimum 1 token for fastest response
-                                            do_sample=False,        # ULTRA-OPTIMIZED: Greedy decoding for maximum speed
+                                            max_new_tokens=150,     # Allow complete sentences
+                                            min_new_tokens=1,       # OPTIMIZED: Allow single token responses
+                                            do_sample=False,        # OPTIMIZED: Greedy decoding for maximum speed
                                             num_beams=1,           # Keep single beam for speed
-                                            temperature=0.01,      # ULTRA-OPTIMIZED: Minimal temperature for fastest generation
-                                            top_p=0.7,            # ULTRA-OPTIMIZED: More focused sampling
-                                            top_k=10,             # ULTRA-OPTIMIZED: Minimal vocabulary for speed
-                                            repetition_penalty=1.4, # ULTRA-OPTIMIZED: Higher penalty for more concise responses
+                                            temperature=0.0,       # OPTIMIZED: No temperature for maximum speed
+                                            top_p=1.0,            # OPTIMIZED: No top-p filtering for speed
+                                            top_k=1,              # OPTIMIZED: Greedy selection only
+                                            repetition_penalty=1.0, # OPTIMIZED: No penalty overhead
                                             pad_token_id=self.processor.tokenizer.eos_token_id if hasattr(self.processor, 'tokenizer') else None,
                                             eos_token_id=self.processor.tokenizer.eos_token_id if hasattr(self.processor, 'tokenizer') else None,
                                             use_cache=True,         # Use KV cache for speed
                                             # ULTRA-LOW LATENCY: Additional optimizations
-                                            early_stopping=True,   # Stop as soon as EOS is generated
+                                            early_stopping=False,  # OPTIMIZED: No early stopping overhead
                                             output_scores=False,   # Don't compute scores for speed
                                             output_attentions=False, # Don't compute attentions for speed
                                             output_hidden_states=False, # Don't compute hidden states for speed
@@ -759,6 +843,255 @@ class VoxtralModel:
         
         return base_info
 
+    async def process_chunked_streaming(self, audio_data: np.ndarray, prompt: str = None,
+                                      chunk_id: str = None, mode: str = "chunked_streaming"):
+        """
+        ULTRA-LOW LATENCY TOKEN-BY-TOKEN STREAMING
+        Target: <100ms first token, <50ms inter-token intervals
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Voxtral model not initialized")
+
+        chunk_id = chunk_id or f"stream_{int(time.time() * 1000000)}"
+        pipeline_start = time.time()
+
+        try:
+            realtime_logger.info(f"🚀 Starting ultra-low latency streaming for {chunk_id}")
+
+            # STEP 1: ULTRA-FAST AUDIO PREPROCESSING (Target: <5ms)
+            preprocessing_start = time.time()
+
+            # Direct tensor processing - no file I/O
+            if hasattr(audio_data, 'cpu'):
+                audio_tensor = audio_data.cpu() if audio_data.dtype == torch.float32 else audio_data.cpu().float()
+            else:
+                audio_tensor = torch.from_numpy(audio_data.astype(np.float32))
+
+            # Fast normalization
+            max_val = torch.abs(audio_tensor).max()
+            if max_val > 0:
+                audio_tensor = audio_tensor * (0.95 / max_val)
+
+            preprocessing_time = (time.time() - preprocessing_start) * 1000
+            realtime_logger.debug(f"⚡ Audio preprocessing: {preprocessing_time:.1f}ms")
+
+            # STEP 2: ULTRA-FAST PROCESSOR (Target: <20ms)
+            processor_start = time.time()
+
+            # Create conversation format for audio processing
+            import tempfile
+            import soundfile as sf
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                sf.write(tmp_file.name, audio_tensor.numpy(), 16000)
+
+                # Create conversation format
+                conversation = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "audio", "path": tmp_file.name}
+                        ]
+                    }
+                ]
+
+                # Process using apply_chat_template
+                inputs = self.processor.apply_chat_template(conversation, return_tensors="pt")
+
+                # Clean up temporary file
+                import os
+                os.unlink(tmp_file.name)
+
+            # Move to device immediately
+            if hasattr(inputs, 'to'):
+                inputs = inputs.to(self.device)
+            elif isinstance(inputs, dict):
+                inputs = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+
+            processor_time = (time.time() - processor_start) * 1000
+            realtime_logger.debug(f"⚡ Processor: {processor_time:.1f}ms")
+
+            # STEP 3: TRUE TOKEN-BY-TOKEN STREAMING (Target: <100ms first token)
+            inference_start = time.time()
+
+            # Import streaming components
+            from transformers import TextIteratorStreamer
+            from threading import Thread
+            import asyncio
+
+            # Initialize streaming components
+            tokenizer = self.processor.tokenizer if hasattr(self.processor, 'tokenizer') else None
+            if not tokenizer:
+                raise RuntimeError("Tokenizer not available for streaming")
+
+            # Create ultra-fast streamer
+            streamer = TextIteratorStreamer(
+                tokenizer,
+                timeout=10.0,  # Longer timeout to avoid queue.Empty errors
+                skip_prompt=True,
+                skip_special_tokens=True
+            )
+
+            # ULTRA-FAST generation parameters
+            generation_kwargs = {
+                **inputs,
+                'streamer': streamer,
+                'max_new_tokens': 150,
+                'min_new_tokens': 1,
+                'do_sample': False,  # Greedy for speed
+                'num_beams': 1,
+                'use_cache': True,
+                'temperature': 0.0,
+                'top_p': 1.0,
+                'top_k': 1,
+                'repetition_penalty': 1.0,
+                'pad_token_id': tokenizer.eos_token_id,
+                'eos_token_id': tokenizer.eos_token_id,
+            }
+
+            realtime_logger.info("🚀 Starting token-by-token streaming generation...")
+
+            # Start generation in background thread for true streaming
+            generation_thread = Thread(
+                target=self.model.generate,
+                kwargs=generation_kwargs
+            )
+            generation_thread.start()
+
+            # STEP 4: REAL-TIME TOKEN STREAMING LOOP
+            from src.utils.semantic_chunking import SemanticChunker
+
+            # Initialize semantic chunker for word-level TTS triggering
+            semantic_chunker = SemanticChunker()
+
+            first_token_time = None
+            first_word_time = None
+            token_count = 0
+            word_count = 0
+            word_buffer = ""
+            full_response = ""
+
+            # Stream tokens as they become available
+            try:
+                for token_text in streamer:
+                    current_time = time.time()
+                    token_count += 1
+
+                    # Track first token timing
+                    if first_token_time is None:
+                        first_token_time = current_time
+                        first_token_latency = (first_token_time - inference_start) * 1000
+                        realtime_logger.info(f"⚡ FIRST TOKEN: {first_token_latency:.1f}ms - '{token_text}'")
+
+                    # Yield immediate token for ultra-low latency
+                    yield {
+                        'type': 'token_chunk',
+                        'text': token_text,
+                        'tokens': [token_text],
+                        'word_count': 0,
+                        'boundary_type': 'token',
+                        'confidence': 1.0,
+                        'chunk_id': f"{chunk_id}_token_{token_count}",
+                        'generation_time_ms': (current_time - inference_start) * 1000,
+                        'is_complete': False,
+                        'timestamp': current_time,
+                        'chunk_sequence': token_count
+                    }
+
+                    # Process for word boundaries using semantic chunker
+                    semantic_chunk = semantic_chunker.process_token(token_text, current_time)
+                    if semantic_chunk:
+                        if first_word_time is None:
+                            first_word_time = current_time
+                            first_word_latency = (first_word_time - inference_start) * 1000
+                            realtime_logger.info(f"📝 FIRST WORD: {first_word_latency:.1f}ms - '{semantic_chunk.text}'")
+
+                        # Yield semantic chunk for immediate TTS processing
+                        yield {
+                            'type': 'semantic_chunk',
+                            'text': semantic_chunk.text,
+                            'tokens': semantic_chunk.tokens,
+                            'word_count': semantic_chunk.word_count,
+                            'boundary_type': semantic_chunk.boundary_type.value,
+                            'confidence': semantic_chunk.confidence,
+                            'chunk_id': f"{chunk_id}_{semantic_chunk.chunk_id}",
+                            'generation_time_ms': (current_time - inference_start) * 1000,
+                            'is_complete': False,
+                            'timestamp': current_time,
+                            'chunk_sequence': semantic_chunk.word_count
+                        }
+
+                        realtime_logger.debug(f"🎯 Word: '{semantic_chunk.text}' "
+                                            f"({semantic_chunk.boundary_type.value})")
+
+                        # Reset word buffer
+                        word_buffer = ""
+
+                    # Small yield to allow other coroutines to run
+                    await asyncio.sleep(0.001)
+
+                # Wait for generation thread to complete
+                generation_thread.join(timeout=1.0)
+
+            except Exception as streaming_error:
+                realtime_logger.error(f"❌ Token streaming error: {streaming_error}")
+                import traceback
+                traceback.print_exc()
+
+            # Finalize any remaining content in the chunker
+            final_chunk = semantic_chunker.finalize_chunk(time.time())
+            if final_chunk:
+                yield {
+                    'type': 'semantic_chunk',
+                    'text': final_chunk.text,
+                    'tokens': final_chunk.tokens,
+                    'word_count': final_chunk.word_count,
+                    'boundary_type': final_chunk.boundary_type.value,
+                    'confidence': final_chunk.confidence,
+                    'chunk_id': f"{chunk_id}_{final_chunk.chunk_id}",
+                    'generation_time_ms': 0,
+                    'is_complete': False,
+                    'timestamp': final_chunk.timestamp
+                }
+
+            # Final completion
+            total_time = (time.time() - pipeline_start) * 1000
+            inference_time = (time.time() - inference_start) * 1000
+            first_token_latency_ms = (first_token_time - inference_start) * 1000 if first_token_time else 0
+            first_word_latency_ms = (first_word_time - inference_start) * 1000 if first_word_time else 0
+
+            yield {
+                'type': 'chunked_streaming_complete',
+                'response_text': full_response,
+                'total_tokens': token_count,
+                'total_chunks': word_count,
+                'first_token_latency_ms': first_token_latency_ms,
+                'first_word_latency_ms': first_word_latency_ms,
+                'inference_time_ms': inference_time,
+                'total_time_ms': total_time,
+                'chunk_id': chunk_id,
+                'timestamp': time.time(),
+                'streaming_method': 'TokenByTokenStreaming'
+            }
+
+            realtime_logger.info(f"✅ Token-by-token streaming completed for {chunk_id}")
+            realtime_logger.info(f"   ⚡ First token: {first_token_latency_ms:.1f}ms")
+            realtime_logger.info(f"   📝 First word: {first_word_latency_ms:.1f}ms")
+            realtime_logger.info(f"   🔤 Total tokens: {token_count}")
+            realtime_logger.info(f"   📊 Total time: {total_time:.1f}ms")
+
+        except Exception as e:
+            realtime_logger.error(f"❌ Error in chunked streaming for {chunk_id}: {e}")
+            import traceback
+            realtime_logger.error(f"❌ Full traceback: {traceback.format_exc()}")
+            yield {
+                'type': 'error',
+                'error': str(e),
+                'chunk_id': chunk_id,
+                'is_complete': True,
+                'timestamp': time.time()
+            }
+
     async def process_streaming_chunk(self, audio_data: np.ndarray, prompt: str = None,
                                     chunk_id: str = None, mode: str = "streaming"):
         """
@@ -828,13 +1161,13 @@ class VoxtralModel:
                     word_buffer = ""
                     step = 0
 
-                    # Generation parameters
+                    # OPTIMIZED: Generation parameters for maximum speed
                     generation_config = {
-                        'do_sample': True,
-                        'temperature': 0.3,
-                        'top_p': 0.9,
-                        'top_k': 50,
-                        'repetition_penalty': 1.2,
+                        'do_sample': False,     # OPTIMIZED: Greedy decoding for maximum speed
+                        'temperature': 0.0,     # OPTIMIZED: No temperature for maximum speed
+                        'top_p': 1.0,          # OPTIMIZED: No top-p filtering for speed
+                        'top_k': 1,            # OPTIMIZED: Greedy selection only
+                        'repetition_penalty': 1.0, # OPTIMIZED: No penalty overhead
                         'pad_token_id': self.processor.tokenizer.eos_token_id if hasattr(self.processor, 'tokenizer') else None,
                         'eos_token_id': self.processor.tokenizer.eos_token_id if hasattr(self.processor, 'tokenizer') else None,
                         'use_cache': True,
@@ -895,8 +1228,8 @@ class VoxtralModel:
                         if new_token_id == generation_config.get('eos_token_id'):
                             break
 
-                        # Small delay to prevent overwhelming
-                        await asyncio.sleep(0.001)
+                        # OPTIMIZED: Minimal delay for maximum speed
+                        await asyncio.sleep(0.0001)
 
                     # Send any remaining text
                     if word_buffer.strip():

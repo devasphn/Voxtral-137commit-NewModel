@@ -63,17 +63,17 @@ tts:
   # ULTRA-LOW LATENCY Performance settings
   performance:
     batch_size: 1  # Direct integration uses batch_size=1
-    max_queue_size: 16  # OPTIMIZED: Reduced queue size for lower latency (was 32)
-    num_workers: 2  # OPTIMIZED: Reduced workers to minimize overhead (was 4)
-    target_latency_ms: 100  # OPTIMIZED: More aggressive target (was 150)
+    max_queue_size: 4  # OPTIMIZED: Ultra-reduced queue size for maximum speed
+    num_workers: 1  # OPTIMIZED: Single worker for minimum overhead
+    target_latency_ms: 50  # OPTIMIZED: Ultra-aggressive target for TTS generation
 
 # ULTRA-LOW LATENCY Speech-to-Speech pipeline configuration
 speech_to_speech:
   enabled: true
-  latency_target_ms: 200  # OPTIMIZED: More aggressive target (was 300)
-  buffer_size: 4096  # OPTIMIZED: Reduced for lower latency (was 8192)
+  latency_target_ms: 100  # OPTIMIZED: Ultra-aggressive target for maximum speed
+  buffer_size: 2048  # OPTIMIZED: Ultra-reduced for minimum latency
   output_format: "wav"
-  quality: "high"
+  quality: "medium"  # OPTIMIZED: Reduced quality for speed
   emotional_expression: false  # OPTIMIZED: Disabled for speed
 
   # STREAMING CONFIGURATION
@@ -87,10 +87,10 @@ speech_to_speech:
 
   # VOICE AGENT OPTIMIZATION
   voice_agent:
-    first_word_target_ms: 100  # Target for first words
-    word_to_audio_target_ms: 150  # Target from words to audio
-    interruption_response_ms: 50  # Target interruption response time
-    concurrent_tts_streams: 3  # Max concurrent TTS processing
+    first_word_target_ms: 50  # OPTIMIZED: Ultra-aggressive target for first words
+    word_to_audio_target_ms: 75  # OPTIMIZED: Ultra-aggressive target from words to audio
+    interruption_response_ms: 25  # OPTIMIZED: Ultra-fast interruption response
+    concurrent_tts_streams: 1  # OPTIMIZED: Single stream for minimum overhead
   
 logging:
   level: "INFO"
