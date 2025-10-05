@@ -2086,150 +2086,185 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
             streaming_logger.error(f"[CONVERSATION] Audio preprocessing error for chunk {chunk_id}: {e}")
             return
         
-        # Smart Conversation Mode - unified processing with performance monitoring
-        mode = "conversation"  # Always use conversation mode
+        # ULTRA-LOW LATENCY MODE - Always use chunked streaming for <400ms latency
+        mode = "chunked_streaming"  # CHANGED: Use streaming mode by default
         prompt = ""  # Prompt is hardcoded in the model
-        
+
         # Start performance timing
         voxtral_timing_id = performance_monitor.start_timing("voxtral_processing", {
             "chunk_id": chunk_id,
             "client_id": client_id,
             "audio_length": len(audio_array)
         })
-        
-        # Check if streaming mode is requested
-        streaming_mode = mode == "streaming" or data.get("streaming", False)
+
+        # ALWAYS use streaming mode for ultra-low latency (can be disabled with streaming=false)
+        streaming_mode = data.get("streaming", True)  # CHANGED: Default to TRUE streaming
 
         try:
             if streaming_mode:
-                # STREAMING MODE: Process with token-by-token streaming
-                streaming_logger.info(f"🎙️ Starting streaming processing for chunk {chunk_id}")
+                # ULTRA-LOW LATENCY STREAMING MODE: Direct token-by-token streaming
+                streaming_logger.info(f"🚀 ULTRA-LOW LATENCY STREAMING for chunk {chunk_id}")
 
-                # Import streaming coordinator
-                from src.streaming.streaming_coordinator import streaming_coordinator
+                # Start audio queue for sequential playback
+                conversation_id = f"{client_id}_{chunk_id}"
+                queue_started = await audio_queue_manager.start_conversation_queue(conversation_id, websocket)
+                if not queue_started:
+                    streaming_logger.warning(f"⚠️ Audio queue already exists for {conversation_id}, reusing")
 
-                # Start streaming session
-                session_id = await streaming_coordinator.start_streaming_session(f"{client_id}_{chunk_id}")
+                # Track metrics
+                full_response = ""
+                word_count = 0
+                token_count = 0
+                first_token_sent = False
+                first_word_sent = False
+                first_audio_sent = False
+                first_token_time = None
+                first_word_time = None
+                first_audio_time = None
 
-                # Check for interruption first
-                current_state = getattr(streaming_coordinator, 'state', 'idle')
-                is_interruption = await detect_user_interruption(audio_array, current_state.value if hasattr(current_state, 'value') else str(current_state))
-
-                if is_interruption:
-                    streaming_logger.info(f"🛑 User interruption detected for {client_id}")
-                    await streaming_coordinator.handle_interruption("user_speech")
-                    await websocket.send_text(json.dumps({
-                        "type": "interruption",
-                        "message": "User interruption detected",
-                        "chunk_id": chunk_id,
-                        "timestamp": time.time()
-                    }))
-                    return
-
-                # Process with chunked streaming Voxtral for sub-500ms latency
-                voxtral_stream = voxtral_model.process_chunked_streaming(
+                # DIRECT STREAMING: Call process_chunked_streaming directly (no coordinator)
+                async for chunk_data in voxtral_model.process_chunked_streaming(
                     audio_array,
                     prompt=prompt,
                     chunk_id=chunk_id,
                     mode="chunked_streaming"
-                )
+                ):
+                    current_time = time.time()
+                    chunk_type = chunk_data.get('type')
 
-                # Process semantic chunks and coordinate immediate TTS
-                full_response = ""
-                chunks_sent_for_tts = []
+                    if chunk_type == 'token_chunk':
+                        token_count += 1
+                        token_text = chunk_data.get('text', '')
 
-                async for stream_chunk in streaming_coordinator.process_chunked_stream(voxtral_stream):
-                    if stream_chunk.type == 'semantic_chunk_ready':
-                        chunk_text = stream_chunk.content['text']
-                        full_response += " " + chunk_text
-                        chunks_sent_for_tts.append(chunk_text)
+                        # Track first token timing
+                        if not first_token_sent:
+                            first_token_time = current_time
+                            first_token_latency = (first_token_time - chunk_start_time) * 1000
+                            first_token_sent = True
+                            streaming_logger.info(f"⚡ FIRST TOKEN: {first_token_latency:.1f}ms - '{token_text}'")
 
-                        # Send semantic chunk to client immediately
+                        # Send token immediately
                         await websocket.send_text(json.dumps({
-                            "type": "semantic_chunk",
-                            "text": chunk_text,
-                            "full_text_so_far": full_response.strip(),
-                            "chunk_id": chunk_id,
-                            "sequence": stream_chunk.content['sequence_number'],
-                            "boundary_type": stream_chunk.content['boundary_type'],
-                            "confidence": stream_chunk.content['confidence'],
-                            "word_count": stream_chunk.content['word_count'],
-                            "generation_time_ms": stream_chunk.content['generation_time_ms'],
-                            "timestamp": time.time()
+                            "type": "token_chunk",
+                            "conversation_id": conversation_id,
+                            "text": token_text,
+                            "chunk_sequence": token_count,
+                            "generation_time_ms": chunk_data.get('generation_time_ms', 0),
+                            "timestamp": current_time
                         }))
 
-                        # Start TTS for semantic chunk immediately (parallel processing)
-                        try:
-                            tts_timing_id = performance_monitor.start_timing("kokoro_chunked_streaming", {
-                                "chunk_id": f"{chunk_id}_tts_{stream_chunk.content['sequence_number']}",
-                                "text_length": len(chunk_text),
-                                "voice": "hm_omega",
-                                "boundary_type": stream_chunk.content['boundary_type'],
-                                "word_count": stream_chunk.content['word_count']
-                            })
+                    elif chunk_type == 'semantic_chunk':
+                        word_count += 1
+                        chunk_text = chunk_data.get('text', '').strip()
 
-                            # Generate TTS for semantic chunk using streaming (immediate processing)
-                            async for tts_chunk in kokoro_model.synthesize_speech_streaming(
-                                chunk_text,
-                                voice="hm_omega",
-                                chunk_id=f"{chunk_id}_tts_{stream_chunk.content['sequence_number']}"
-                            ):
-                                if tts_chunk.get('audio_chunk'):
-                                    # Send audio chunk immediately (parallel processing)
-                                    audio_b64 = base64.b64encode(tts_chunk['audio_chunk']).decode('utf-8')
-                                    await websocket.send_text(json.dumps({
-                                        "type": "chunked_streaming_audio",
-                                        "audio_data": audio_b64,
-                                        "chunk_index": tts_chunk['chunk_index'],
-                                        "is_final": tts_chunk['is_final'],
-                                        "sample_rate": tts_chunk['sample_rate'],
-                                        "text_source": chunk_text,
-                                        "boundary_type": stream_chunk.content['boundary_type'],
-                                        "semantic_chunk_id": stream_chunk.content['sequence_number'],
-                                        "timestamp": time.time()
-                                    }))
+                        if chunk_text:
+                            full_response += " " + chunk_text
 
-                                elif tts_chunk.get('is_final'):
-                                    tts_time = performance_monitor.end_timing(tts_timing_id)
-                                    streaming_logger.info(f"✅ TTS chunk completed in {tts_time:.1f}ms")
+                            # Track first word timing
+                            if not first_word_sent:
+                                first_word_time = current_time
+                                first_word_latency = (first_word_time - chunk_start_time) * 1000
+                                first_word_sent = True
+                                streaming_logger.info(f"📝 FIRST WORD: {first_word_latency:.1f}ms - '{chunk_text}'")
 
-                        except Exception as tts_error:
-                            streaming_logger.error(f"❌ TTS error for chunk '{chunk_text}': {tts_error}")
+                            # Send semantic chunk to client
                             await websocket.send_text(json.dumps({
-                                "type": "tts_error",
-                                "error": str(tts_error),
-                                "text_source": chunk_text,
-                                "chunk_id": chunk_id,
-                                "boundary_type": stream_chunk.content['boundary_type']
+                                "type": "semantic_chunk",
+                                "conversation_id": conversation_id,
+                                "text": chunk_text,
+                                "full_text_so_far": full_response.strip(),
+                                "chunk_sequence": word_count,
+                                "boundary_type": chunk_data.get('boundary_type', 'word'),
+                                "confidence": chunk_data.get('confidence', 1.0),
+                                "generation_time_ms": chunk_data.get('generation_time_ms', 0),
+                                "timestamp": current_time
                             }))
 
-                    elif stream_chunk.type == 'session_complete':
+                            # ULTRA-FAST TTS WITH QUEUE MANAGEMENT
+                            tts_start = time.time()
+                            try:
+                                # Stream TTS audio chunks - TRUE STREAMING
+                                async for tts_chunk in kokoro_model.synthesize_speech_streaming(
+                                    chunk_text,
+                                    voice="hm_omega",
+                                    chunk_id=f"{chunk_id}_word_{word_count}"
+                                ):
+                                    if tts_chunk.get('audio_chunk') is not None:
+                                        audio_data = tts_chunk['audio_chunk']
+
+                                        # Track first audio timing
+                                        if not first_audio_sent:
+                                            first_audio_time = current_time
+                                            first_audio_latency = (first_audio_time - chunk_start_time) * 1000
+                                            first_audio_sent = True
+                                            streaming_logger.info(f"🔊 FIRST AUDIO: {first_audio_latency:.1f}ms")
+
+                                        # Create audio chunk object for queue
+                                        audio_chunk_obj = AudioChunk(
+                                            audio_data=audio_data if isinstance(audio_data, bytes) else audio_data.astype(np.int16).tobytes(),
+                                            chunk_id=tts_chunk.get('chunk_id', f"{chunk_id}_word_{word_count}_audio_{tts_chunk.get('chunk_index', 0)}"),
+                                            voice="hm_omega",
+                                            sample_rate=tts_chunk.get('sample_rate', 24000),
+                                            chunk_index=tts_chunk.get('chunk_index', 0),
+                                            timestamp=time.time(),
+                                            text_source=chunk_text,
+                                            conversation_id=conversation_id,
+                                            chunk_size_bytes=tts_chunk.get('chunk_size_bytes', 0)
+                                        )
+
+                                        # Enqueue for sequential playback
+                                        await audio_queue_manager.enqueue_audio(audio_chunk_obj)
+
+                                        tts_time = (time.time() - tts_start) * 1000
+                                        streaming_logger.debug(f"🎵 TTS chunk enqueued: {tts_time:.1f}ms")
+
+                            except Exception as tts_error:
+                                streaming_logger.error(f"❌ TTS error for '{chunk_text}': {tts_error}")
+                                import traceback
+                                traceback.print_exc()
+
+                    elif chunk_type == 'chunked_streaming_complete':
+                        # Calculate final metrics
+                        total_time = (time.time() - chunk_start_time) * 1000
+
                         # End Voxtral timing
                         voxtral_processing_time = performance_monitor.end_timing(voxtral_timing_id)
 
-                        # Send completion with chunked streaming stats
+                        # Get queue statistics
+                        queue_stats = audio_queue_manager.get_stats(conversation_id)
+
+                        # Send completion
                         await websocket.send_text(json.dumps({
                             "type": "chunked_streaming_complete",
-                            "full_response": full_response.strip(),
-                            "total_chunks_sent": len(chunks_sent_for_tts),
-                            "total_time_ms": stream_chunk.content.get('total_time_ms', 0),
-                            "inference_time_ms": stream_chunk.content.get('inference_time_ms', 0),
-                            "total_tokens": stream_chunk.content.get('total_tokens', 0),
+                            "conversation_id": conversation_id,
+                            "response_text": full_response.strip(),
+                            "total_tokens": token_count,
+                            "total_words": word_count,
+                            "total_time_ms": total_time,
+                            "first_token_latency_ms": chunk_data.get('first_token_latency_ms', 0),
+                            "first_word_latency_ms": chunk_data.get('first_word_latency_ms', 0),
+                            "first_audio_latency_ms": (first_audio_time - chunk_start_time) * 1000 if first_audio_time else 0,
                             "voxtral_time_ms": voxtral_processing_time,
-                            "chunk_id": chunk_id,
+                            "streaming_method": "TokenByTokenStreaming",
+                            "queue_stats": queue_stats,
+                            "success": True,
                             "timestamp": time.time()
                         }))
-                        streaming_logger.info(f"✅ Chunked streaming session completed: {len(chunks_sent_for_tts)} semantic chunks sent "
-                                            f"in {stream_chunk.content.get('total_time_ms', 0):.1f}ms")
-                        break
 
-                    elif stream_chunk.type == 'error':
-                        streaming_logger.error(f"❌ Streaming error: {stream_chunk.content}")
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "message": f"Streaming error: {stream_chunk.content.get('error', 'Unknown error')}",
-                            "chunk_id": chunk_id
-                        }))
+                        # Log final metrics
+                        streaming_logger.info(f"✅ ULTRA-LOW LATENCY COMPLETE: {conversation_id}")
+                        streaming_logger.info(f"   ⚡ Total time: {total_time:.1f}ms")
+                        streaming_logger.info(f"   🔤 Tokens: {token_count}")
+                        streaming_logger.info(f"   📝 Words: {word_count}")
+                        if first_token_time:
+                            streaming_logger.info(f"   ⚡ First token: {(first_token_time - chunk_start_time) * 1000:.1f}ms")
+                        if first_word_time:
+                            streaming_logger.info(f"   📝 First word: {(first_word_time - chunk_start_time) * 1000:.1f}ms")
+                        if first_audio_time:
+                            streaming_logger.info(f"   🔊 First audio: {(first_audio_time - chunk_start_time) * 1000:.1f}ms")
+
+                        # Stop audio queue after delay
+                        asyncio.create_task(stop_queue_after_delay(conversation_id, delay=2.0))
                         break
 
             else:
