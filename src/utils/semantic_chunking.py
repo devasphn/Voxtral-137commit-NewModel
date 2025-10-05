@@ -124,14 +124,15 @@ class SemanticChunker:
     """
     
     def __init__(self):
-        # ULTRA-LOW LATENCY configuration for <100ms chunking
+        # ✅ OPTIMIZED CONFIGURATION: Balance between latency and natural speech
+        # Larger chunks = more natural speech flow with minimal latency increase
         self.config = {
-            'min_words_per_chunk': 1,      # Single word chunks for maximum speed
-            'max_words_per_chunk': 2,      # Very small chunks for immediate TTS
-            'min_tokens_per_chunk': 1,     # Single token minimum for instant streaming
-            'max_tokens_per_chunk': 4,     # Small token limit for speed
+            'min_words_per_chunk': 2,      # Minimum 2 words for natural phrases
+            'max_words_per_chunk': 5,      # Up to 5 words for complete phrases
+            'min_tokens_per_chunk': 2,     # Minimum 2 tokens
+            'max_tokens_per_chunk': 10,    # Allow longer phrases
             'chunk_overlap_words': 0,      # No overlap for speed
-            'confidence_threshold': 0.3    # Very low threshold for aggressive chunking
+            'confidence_threshold': 0.5    # Balanced threshold for quality chunks
         }
         
         # Semantic boundary patterns
@@ -187,28 +188,25 @@ class SemanticChunker:
             # Only break on clause if we have enough content
             if word_count >= 3:
                 return True, ChunkBoundaryType.CLAUSE_BREAK, 0.8
-        
+
         # Check for phrase patterns
         text_lower = text.lower()
         for pattern in self.phrase_patterns:
             if re.search(pattern, text_lower):
                 if word_count >= 2:
                     return True, ChunkBoundaryType.PHRASE_BREAK, 0.75
-        
+
         # Check for phrase indicator words
         last_words = words[-2:] if len(words) >= 2 else words
         for word in last_words:
             if word.lower() in self.phrase_indicators:
                 if word_count >= 3:
                     return True, ChunkBoundaryType.PHRASE_BREAK, 0.7
-        
-        # ULTRA-AGGRESSIVE: chunk on single complete word for maximum speed
-        if word_count >= 1:
-            return True, ChunkBoundaryType.WORD_COUNT, 0.5
 
-        # Even chunk on single meaningful token if it looks like a word
-        if token_count >= 1 and len(text.strip()) >= 2:
-            return True, ChunkBoundaryType.WORD_COUNT, 0.4
+        # ✅ OPTIMIZED: Create chunks at natural word boundaries (2-5 words)
+        # This creates more natural speech flow instead of word-by-word
+        if word_count >= self.config['min_words_per_chunk']:
+            return True, ChunkBoundaryType.WORD_COUNT, 0.6
 
         return False, None, 0.0
     

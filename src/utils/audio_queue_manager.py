@@ -260,9 +260,10 @@ class AudioQueueManager:
                 
                 # Mark task as done
                 queue.task_done()
-                
-                # Small delay to prevent overwhelming the client
-                await asyncio.sleep(0.005)
+
+                # ✅ OPTIMIZED: Minimal delay for smoother playback
+                # Reduced from 5ms to 1ms for more natural speech flow
+                await asyncio.sleep(0.001)
                 
         except Exception as e:
             audio_queue_logger.error(f"❌ Playback worker error for {conversation_id}: {e}")
@@ -307,6 +308,8 @@ class AudioQueueManager:
                         "timestamp": time.time()
                     }))
                     audio_queue_logger.info(f"📤 Sent audio_interrupted signal to client")
+                except WebSocketDisconnect:
+                    audio_queue_logger.warning(f"⚠️ WebSocket disconnected during interrupt for {conversation_id}")
                 except Exception as e:
                     audio_queue_logger.error(f"❌ Failed to send interrupt signal: {e}")
 

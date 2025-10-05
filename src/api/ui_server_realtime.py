@@ -1245,8 +1245,9 @@ async def home(request: Request):
                     console.error('Audio playback error:', error);
                 }
 
-                // ULTRA-LOW LATENCY: Minimal delay between audio chunks
-                await new Promise(resolve => setTimeout(resolve, 25));  // OPTIMIZED: Reduced from 100ms to 25ms
+                // ✅ OPTIMIZED: Minimal delay for natural speech flow
+                // Reduced to 5ms for smoother transitions between chunks
+                await new Promise(resolve => setTimeout(resolve, 5));
             }
 
             isPlayingAudio = false;
@@ -2231,21 +2232,25 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
 
         streaming_logger.info(f"[CONVERSATION] Processing chunk {chunk_id} for {client_id}")
 
-        # ✅ BARGE-IN FEATURE: Check if audio is currently playing
+        # ✅ ENHANCED BARGE-IN FEATURE: More robust interruption detection
         # If user speaks during TTS playback, interrupt immediately
         # Note: audio_queue_manager is imported at module level (line 27)
 
         # Check if there's an active playback for this client
         # We use a simplified conversation_id based on client_id
-        active_conversation_id = None
-        for conv_id in audio_queue_manager.conversation_queues.keys():
+        active_conversation_ids = []
+        for conv_id in list(audio_queue_manager.conversation_queues.keys()):
             if conv_id.startswith(client_id):
-                active_conversation_id = conv_id
-                break
+                active_conversation_ids.append(conv_id)
 
-        if active_conversation_id and audio_queue_manager.is_playing.get(active_conversation_id, False):
-            streaming_logger.info(f"🛑 BARGE-IN: User speaking during playback - interrupting audio")
-            await audio_queue_manager.interrupt_playback(active_conversation_id)
+        # Interrupt ALL active conversations for this client (more robust)
+        for active_conversation_id in active_conversation_ids:
+            if audio_queue_manager.is_playing.get(active_conversation_id, False):
+                streaming_logger.info(f"🛑 BARGE-IN: User speaking during playback - interrupting {active_conversation_id}")
+                try:
+                    await audio_queue_manager.interrupt_playback(active_conversation_id)
+                except Exception as e:
+                    streaming_logger.error(f"❌ Error interrupting playback for {active_conversation_id}: {e}")
 
         # Get services from unified manager
         unified_manager = get_unified_manager()
