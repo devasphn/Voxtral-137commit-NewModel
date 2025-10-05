@@ -1002,8 +1002,113 @@ async def home(request: Request):
                     handleSequentialAudio(data);
                     break;
 
+                case 'token_chunk':
+                    // ✅ NEW: Handle individual token chunks from streaming
+                    handleTokenChunk(data);
+                    break;
+
+                case 'semantic_chunk':
+                    // ✅ NEW: Handle semantic chunks (words/phrases) from streaming
+                    handleSemanticChunk(data);
+                    break;
+
+                case 'chunked_streaming_complete':
+                    // ✅ NEW: Handle streaming completion with statistics
+                    handleStreamingComplete(data);
+                    break;
+
                 default:
                     log(`Unknown message type: ${data.type}`);
+            }
+        }
+
+        // ✅ NEW: Handle token chunks from ultra-low latency streaming
+        function handleTokenChunk(data) {
+            try {
+                const tokenText = data.text || '';
+                const interTokenLatency = data.inter_token_latency_ms || 0;
+
+                log(`🔤 Token ${data.chunk_sequence}: "${tokenText}" (${interTokenLatency.toFixed(1)}ms)`);
+
+                // Update response display with token (append to current response)
+                const responseDiv = document.getElementById('responseText');
+                if (responseDiv) {
+                    // Append token to existing text
+                    responseDiv.textContent += tokenText;
+                }
+
+                // Update status to show streaming is active
+                if (data.chunk_sequence === 1) {
+                    updateStatus('🔄 Streaming response...', 'success');
+                }
+
+            } catch (error) {
+                log(`❌ Error handling token chunk: ${error}`);
+                console.error('Token chunk error:', error);
+            }
+        }
+
+        // ✅ NEW: Handle semantic chunks (words/phrases) from streaming
+        function handleSemanticChunk(data) {
+            try {
+                const chunkText = data.text || '';
+                const fullTextSoFar = data.full_text_so_far || '';
+                const boundaryType = data.boundary_type || 'word';
+
+                log(`📝 Semantic chunk ${data.chunk_sequence}: "${chunkText}" (${boundaryType})`);
+
+                // Update response display with full text so far
+                const responseDiv = document.getElementById('responseText');
+                if (responseDiv) {
+                    responseDiv.textContent = fullTextSoFar;
+                }
+
+                // Update status
+                updateStatus(`🔄 Streaming: "${chunkText}"...`, 'success');
+
+            } catch (error) {
+                log(`❌ Error handling semantic chunk: ${error}`);
+                console.error('Semantic chunk error:', error);
+            }
+        }
+
+        // ✅ NEW: Handle streaming completion with statistics
+        function handleStreamingComplete(data) {
+            try {
+                const responseText = data.response_text || '';
+                const totalTokens = data.total_tokens || 0;
+                const totalWords = data.total_words || 0;
+                const totalTime = data.total_time_ms || 0;
+                const firstTokenLatency = data.first_token_latency_ms || 0;
+                const firstWordLatency = data.first_word_latency_ms || 0;
+                const firstAudioLatency = data.first_audio_latency_ms || 0;
+
+                log(`✅ Streaming complete: "${responseText}"`);
+                log(`   📊 Stats: ${totalTokens} tokens, ${totalWords} words in ${totalTime.toFixed(1)}ms`);
+                log(`   ⚡ First token: ${firstTokenLatency.toFixed(1)}ms`);
+                log(`   📝 First word: ${firstWordLatency.toFixed(1)}ms`);
+                log(`   🔊 First audio: ${firstAudioLatency.toFixed(1)}ms`);
+
+                // Update final response display
+                const responseDiv = document.getElementById('responseText');
+                if (responseDiv) {
+                    responseDiv.textContent = responseText;
+                }
+
+                // Update status
+                updateStatus(`✅ Response complete (${totalTime.toFixed(0)}ms)`, 'success');
+
+                // ✅ CRITICAL FIX: Reset pendingResponse to allow next interaction
+                pendingResponse = false;
+
+                // Show performance metrics if available
+                if (data.queue_stats) {
+                    log(`   🎵 Queue stats: ${JSON.stringify(data.queue_stats)}`);
+                }
+
+            } catch (error) {
+                log(`❌ Error handling streaming complete: ${error}`);
+                console.error('Streaming complete error:', error);
             }
         }
 
@@ -1011,19 +1116,32 @@ async def home(request: Request):
             try {
                 log(`🎵 Received sequential audio chunk ${data.chunk_index} for ${data.conversation_id} (${data.audio_data.length} chars, text: "${data.text_source}")`);
 
+                // ✅ FIX: Create metadata object with sample rate and duration info
+                const sampleRate = data.sample_rate || 24000;
+                const chunkSizeBytes = data.chunk_size_bytes || 0;
+                // Estimate duration: (bytes - 44 WAV header) / (sample_rate * 2 bytes per sample)
+                const audioDurationMs = chunkSizeBytes > 44 ? ((chunkSizeBytes - 44) / (sampleRate * 2)) * 1000 : 0;
+
                 // Add to audio queue for sequential playback
                 audioQueue.push({
                     chunkId: data.chunk_id,
                     audioData: data.audio_data,
-                    sampleRate: data.sample_rate || 24000,
+                    sampleRate: sampleRate,
                     chunkIndex: data.chunk_index,
                     voice: data.voice || 'unknown',
                     textSource: data.text_source || '',
                     conversationId: data.conversation_id,
-                    queuePosition: data.queue_position || 0
+                    queuePosition: data.queue_position || 0,
+                    // ✅ FIX: Add metadata object to prevent undefined error
+                    metadata: {
+                        audio_duration_ms: audioDurationMs,
+                        sample_rate: sampleRate,
+                        chunk_size_bytes: chunkSizeBytes,
+                        format: data.format || 'wav'
+                    }
                 });
 
-                log(`🎵 Added sequential audio to queue. Queue length: ${audioQueue.length}, chunk index: ${data.chunk_index}`);
+                log(`🎵 Added sequential audio to queue. Queue length: ${audioQueue.length}, chunk index: ${data.chunk_index}, duration: ${audioDurationMs.toFixed(1)}ms`);
 
                 // Start processing queue if not already playing
                 if (!isPlayingAudio) {
@@ -1094,7 +1212,8 @@ async def home(request: Request):
         function playAudioItem(audioItem) {
             return new Promise((resolve, reject) => {
                 try {
-                    const { chunkId, audioData, metadata, voice } = audioItem;
+                    // ✅ FIX: Extract all properties including metadata and sampleRate
+                    const { chunkId, audioData, metadata = {}, voice, sampleRate = 24000 } = audioItem;
 
                     log(`🎵 Converting base64 audio for chunk ${chunkId} (${audioData.length} chars)`);
 
@@ -1131,9 +1250,10 @@ async def home(request: Request):
                     audio.preload = 'auto';
                     audio.volume = 1.0;
 
-                    // Enhanced audio debugging
+                    // ✅ FIX: Enhanced audio debugging with proper metadata and sample rate
                     log(`🎵 Audio metadata: ${JSON.stringify(metadata)}`);
                     log(`🎵 Audio blob size: ${audioBlob.size} bytes, type: ${audioBlob.type}`);
+                    log(`🎵 Sample rate: ${sampleRate}Hz, Voice: ${voice}`);
 
                     // Store reference for cleanup
                     currentAudio = audio;
@@ -1144,11 +1264,14 @@ async def home(request: Request):
                     });
 
                     audio.addEventListener('loadedmetadata', () => {
-                        log(`🎵 Audio metadata loaded - Duration: ${audio.duration}s, Sample Rate: ${audio.sampleRate || 'unknown'}Hz`);
+                        // ✅ FIX: Use sampleRate from audioItem, not audio.sampleRate (which is always undefined in HTML5 Audio)
+                        log(`🎵 Audio metadata loaded - Duration: ${audio.duration}s, Sample Rate: ${sampleRate}Hz`);
                     });
 
                     audio.addEventListener('canplaythrough', () => {
-                        log(`🎵 Audio chunk ${chunkId} ready to play (${metadata.audio_duration_ms || 'unknown'}ms)`);
+                        // ✅ FIX: Safely access metadata properties with fallback
+                        const durationMs = metadata?.audio_duration_ms || (audio.duration * 1000) || 'unknown';
+                        log(`🎵 Audio chunk ${chunkId} ready to play (${durationMs}ms)`);
                         log(`🎵 Browser audio info - Duration: ${audio.duration}s, Buffered: ${audio.buffered.length} ranges`);
                     });
 
