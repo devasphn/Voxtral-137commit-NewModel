@@ -885,12 +885,23 @@ class VoxtralModel:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
                 sf.write(tmp_file.name, audio_tensor.numpy(), 16000)
 
-                # Create conversation format
+                # ✅ FIX: Add anti-markdown instruction to prevent markdown generation
+                # NOTE: Voxtral does NOT support system prompts yet (as per official docs)
+                # So we add the instruction as part of the user message content
+                anti_markdown_instruction = (
+                    "Respond in plain conversational text only. "
+                    "Do not use any markdown formatting like **bold**, *italic*, or - bullet points. "
+                    "Speak naturally as if having a friendly conversation. "
+                    "Keep responses clear, concise, and complete."
+                )
+
+                # Create conversation format with anti-markdown instruction
                 conversation = [
                     {
                         "role": "user",
                         "content": [
-                            {"type": "audio", "path": tmp_file.name}
+                            {"type": "audio", "path": tmp_file.name},
+                            {"type": "text", "text": anti_markdown_instruction}
                         ]
                     }
                 ]
@@ -976,6 +987,12 @@ class VoxtralModel:
             try:
                 for token_text in streamer:
                     current_time = time.time()
+
+                    # ✅ FIX: Filter out empty tokens before processing
+                    if not token_text or not token_text.strip():
+                        realtime_logger.debug(f"⏭️ Skipped empty token at position {token_count + 1}")
+                        continue
+
                     token_count += 1
 
                     # Calculate inter-token latency

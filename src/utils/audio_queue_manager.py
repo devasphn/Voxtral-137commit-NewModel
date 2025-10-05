@@ -266,15 +266,59 @@ class AudioQueueManager:
         finally:
             audio_queue_logger.info(f"🛑 Playback worker stopped for {conversation_id}")
     
+    async def interrupt_playback(self, conversation_id: str):
+        """
+        ✅ BARGE-IN FEATURE: Immediately interrupt audio playback
+        This is called when user starts speaking during TTS playback
+        """
+        async with self.manager_lock:
+            if conversation_id not in self.conversation_queues:
+                audio_queue_logger.debug(f"⚠️ No queue exists for {conversation_id} to interrupt")
+                return
+
+            audio_queue_logger.info(f"🛑 INTERRUPTION: User barge-in detected for {conversation_id}")
+
+            # Clear queue immediately
+            queue = self.conversation_queues[conversation_id]
+            cleared_count = 0
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                    queue.task_done()
+                    cleared_count += 1
+                except asyncio.QueueEmpty:
+                    break
+
+            audio_queue_logger.info(f"🗑️ Cleared {cleared_count} pending audio chunks from queue")
+
+            # Send stop signal to client
+            if conversation_id in self.conversation_websockets:
+                websocket = self.conversation_websockets[conversation_id]
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "audio_interrupted",
+                        "conversation_id": conversation_id,
+                        "cleared_chunks": cleared_count,
+                        "timestamp": time.time()
+                    }))
+                    audio_queue_logger.info(f"📤 Sent audio_interrupted signal to client")
+                except Exception as e:
+                    audio_queue_logger.error(f"❌ Failed to send interrupt signal: {e}")
+
+            # Reset playing state
+            self.is_playing[conversation_id] = False
+
+            audio_queue_logger.info(f"✅ Playback interrupted successfully for {conversation_id}")
+
     async def stop_conversation_queue(self, conversation_id: str):
         """Stop playback and clear queue for a conversation"""
         async with self.manager_lock:
             if conversation_id not in self.conversation_queues:
                 audio_queue_logger.warning(f"⚠️ No queue exists for {conversation_id}")
                 return
-            
+
             audio_queue_logger.info(f"🛑 Stopping queue for {conversation_id}")
-            
+
             # Clear queue
             queue = self.conversation_queues[conversation_id]
             while not queue.empty():
@@ -283,10 +327,10 @@ class AudioQueueManager:
                     queue.task_done()
                 except asyncio.QueueEmpty:
                     break
-            
+
             # Send termination signal
             await queue.put(None)
-            
+
             # Wait for worker to finish
             if conversation_id in self.conversation_workers:
                 worker = self.conversation_workers[conversation_id]
@@ -295,7 +339,7 @@ class AudioQueueManager:
                 except asyncio.TimeoutError:
                     audio_queue_logger.warning(f"⚠️ Worker timeout for {conversation_id}")
                     worker.cancel()
-            
+
             # Cleanup
             del self.conversation_queues[conversation_id]
             del self.conversation_voices[conversation_id]
@@ -305,7 +349,7 @@ class AudioQueueManager:
             del self.send_latency_ms[conversation_id]
             if conversation_id in self.conversation_workers:
                 del self.conversation_workers[conversation_id]
-            
+
             audio_queue_logger.info(f"✅ Queue stopped and cleaned up for {conversation_id}")
     
     def get_stats(self, conversation_id: str) -> Dict[str, Any]:

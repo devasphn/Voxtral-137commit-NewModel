@@ -1017,8 +1017,47 @@ async def home(request: Request):
                     handleStreamingComplete(data);
                     break;
 
+                case 'audio_interrupted':
+                    // ✅ BARGE-IN: Handle audio interruption from server
+                    handleAudioInterruption(data);
+                    break;
+
                 default:
                     log(`Unknown message type: ${data.type}`);
+            }
+        }
+
+        // ✅ BARGE-IN FEATURE: Handle audio interruption
+        function handleAudioInterruption(data) {
+            try {
+                const clearedChunks = data.cleared_chunks || 0;
+
+                log(`🛑 AUDIO INTERRUPTED: Cleared ${clearedChunks} pending chunks`);
+
+                // Stop current audio immediately
+                if (currentAudio) {
+                    currentAudio.pause();
+                    currentAudio.currentTime = 0;
+                    currentAudio = null;
+                    log(`⏹️ Stopped current audio playback`);
+                }
+
+                // Clear client-side audio queue
+                const queueLength = audioQueue.length;
+                audioQueue = [];
+                log(`🗑️ Cleared ${queueLength} chunks from client queue`);
+
+                // Reset playback state
+                isPlayingAudio = false;
+
+                // Update status
+                updateStatus('🎙️ Ready for your input', 'success');
+
+                log(`✅ Audio interruption handled successfully`);
+
+            } catch (error) {
+                log(`❌ Error handling audio interruption: ${error}`);
+                console.error('Audio interruption error:', error);
             }
         }
 
@@ -1027,6 +1066,12 @@ async def home(request: Request):
             try {
                 const tokenText = data.text || '';
                 const interTokenLatency = data.inter_token_latency_ms || 0;
+
+                // ✅ CLIENT-SIDE VALIDATION: Skip empty tokens
+                if (!tokenText || !tokenText.trim()) {
+                    log(`⏭️ Skipped empty token at sequence ${data.chunk_sequence}`, 'debug');
+                    return;
+                }
 
                 log(`🔤 Token ${data.chunk_sequence}: "${tokenText}" (${interTokenLatency.toFixed(1)}ms)`);
 
@@ -2185,6 +2230,23 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
         chunk_id = data.get("chunk_id", 0)
 
         streaming_logger.info(f"[CONVERSATION] Processing chunk {chunk_id} for {client_id}")
+
+        # ✅ BARGE-IN FEATURE: Check if audio is currently playing
+        # If user speaks during TTS playback, interrupt immediately
+        audio_queue_manager = get_audio_queue_manager()
+        conversation_id = f"{client_id}_{chunk_id}"
+
+        # Check if there's an active playback for this client
+        # We use a simplified conversation_id based on client_id
+        active_conversation_id = None
+        for conv_id in audio_queue_manager.conversation_queues.keys():
+            if conv_id.startswith(client_id):
+                active_conversation_id = conv_id
+                break
+
+        if active_conversation_id and audio_queue_manager.is_playing.get(active_conversation_id, False):
+            streaming_logger.info(f"🛑 BARGE-IN: User speaking during playback - interrupting audio")
+            await audio_queue_manager.interrupt_playback(active_conversation_id)
 
         # Get services from unified manager
         unified_manager = get_unified_manager()
