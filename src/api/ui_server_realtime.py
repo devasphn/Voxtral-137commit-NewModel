@@ -2068,6 +2068,14 @@ async def handle_speech_to_speech_chunked_streaming(websocket: WebSocket, messag
                             "timestamp": current_time
                         }))
 
+                        # ✅ VALIDATION: Import validation utilities
+                        from src.utils.semantic_chunking import is_valid_tts_text
+
+                        # ✅ VALIDATION: Only send to TTS if text is valid
+                        if not is_valid_tts_text(chunk_text, min_length=1):
+                            streaming_logger.debug(f"⏭️ Skipped TTS for invalid text: '{chunk_text}'")
+                            continue
+
                         # STEP 6: ULTRA-FAST TTS SYNTHESIS WITH QUEUE MANAGEMENT (Target: <50ms)
                         tts_start = time.time()
                         try:
@@ -2304,6 +2312,14 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                                 first_word_latency = (first_word_time - chunk_start_time) * 1000
                                 first_word_sent = True
                                 streaming_logger.info(f"📝 FIRST WORD: {first_word_latency:.1f}ms - '{chunk_text}'")
+
+                            # ✅ VALIDATION: Import validation utilities
+                            from src.utils.semantic_chunking import is_valid_tts_text
+
+                            # ✅ VALIDATION: Only send to client and TTS if text is valid
+                            if not is_valid_tts_text(chunk_text, min_length=1):
+                                streaming_logger.debug(f"⏭️ Skipped invalid semantic chunk: '{chunk_text}'")
+                                continue
 
                             # Send semantic chunk to client
                             await websocket.send_text(json.dumps({

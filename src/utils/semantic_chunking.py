@@ -13,6 +13,90 @@ from enum import Enum
 chunk_logger = logging.getLogger("semantic_chunking")
 chunk_logger.setLevel(logging.INFO)
 
+def preprocess_text_for_tts(text: str) -> str:
+    """
+    Preprocess text to remove markdown formatting and problematic characters
+    that cause TTS delays or errors.
+
+    Args:
+        text: Raw text that may contain markdown formatting
+
+    Returns:
+        Cleaned text suitable for TTS synthesis
+    """
+    if not text:
+        return ""
+
+    # Strip leading/trailing whitespace
+    text = text.strip()
+
+    # Remove markdown bold/italic formatting: **text** or *text* -> text
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # **bold** -> bold
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)      # *italic* -> italic
+
+    # Remove markdown headers: ### Header -> Header
+    text = re.sub(r'^#{1,6}\s+', '', text)
+
+    # Remove markdown list markers at start: - item or * item -> item
+    text = re.sub(r'^[-*]\s+', '', text)
+
+    # Remove standalone dashes/hyphens that generate no audio
+    text = re.sub(r'^\s*-\s*$', '', text)
+
+    # Remove multiple colons (problematic for TTS): :: -> :
+    text = re.sub(r':+', ':', text)
+
+    # Remove trailing colons that cause issues: "History:" -> "History"
+    # But keep colons in middle of sentences
+    text = re.sub(r':\s*$', '', text)
+
+    # Remove multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+
+    # Final strip
+    text = text.strip()
+
+    return text
+
+def is_valid_tts_text(text: str, min_length: int = 1) -> bool:
+    """
+    Validate if text is suitable for TTS synthesis.
+
+    Args:
+        text: Text to validate
+        min_length: Minimum length requirement (default: 1 character)
+
+    Returns:
+        True if text is valid for TTS, False otherwise
+    """
+    if not text:
+        return False
+
+    # Strip whitespace for validation
+    text = text.strip()
+
+    # Check minimum length
+    if len(text) < min_length:
+        return False
+
+    # Reject empty strings
+    if not text:
+        return False
+
+    # Reject strings with only special characters
+    if re.match(r'^[^a-zA-Z0-9]+$', text):
+        return False
+
+    # Reject standalone dashes/hyphens
+    if text in ['-', '--', '---', '*', '**', '***']:
+        return False
+
+    # Reject strings with only whitespace
+    if text.isspace():
+        return False
+
+    return True
+
 class ChunkBoundaryType(Enum):
     """Types of semantic boundaries for chunking"""
     SENTENCE_END = "sentence_end"      # . ! ?
@@ -143,25 +227,36 @@ class SemanticChunker:
         )
 
         if is_boundary and confidence >= self.config['confidence_threshold']:
-            # Create chunk
-            chunk = SemanticChunk(
-                text=self.current_buffer.strip(),
-                tokens=self.current_tokens.copy(),
-                word_count=len(self.current_buffer.strip().split()),
-                boundary_type=boundary_type,
-                confidence=confidence,
-                chunk_id=f"chunk_{self.chunk_counter}",
-                timestamp=timestamp
-            )
+            # ✅ PREPROCESSING: Clean text before creating chunk
+            cleaned_text = preprocess_text_for_tts(self.current_buffer)
 
-            chunk_logger.debug(f"🔄 Created chunk: '{chunk.text}' ({chunk.boundary_type.value}, conf: {confidence:.2f})")
+            # ✅ VALIDATION: Only create chunk if text is valid for TTS
+            if is_valid_tts_text(cleaned_text):
+                # Create chunk with cleaned text
+                chunk = SemanticChunk(
+                    text=cleaned_text,
+                    tokens=self.current_tokens.copy(),
+                    word_count=len(cleaned_text.split()),
+                    boundary_type=boundary_type,
+                    confidence=confidence,
+                    chunk_id=f"chunk_{self.chunk_counter}",
+                    timestamp=timestamp
+                )
 
-            # Reset buffer for next chunk
-            self.current_buffer = ""
-            self.current_tokens = []
-            self.chunk_counter += 1
+                chunk_logger.debug(f"🔄 Created chunk: '{chunk.text}' ({chunk.boundary_type.value}, conf: {confidence:.2f})")
 
-            return chunk
+                # Reset buffer for next chunk
+                self.current_buffer = ""
+                self.current_tokens = []
+                self.chunk_counter += 1
+
+                return chunk
+            else:
+                # ✅ SKIP INVALID TEXT: Log and reset buffer without creating chunk
+                chunk_logger.debug(f"⏭️ Skipped invalid chunk: '{cleaned_text}' (empty/special chars only)")
+                self.current_buffer = ""
+                self.current_tokens = []
+                # Don't increment counter for skipped chunks
 
         return None
 
@@ -184,61 +279,38 @@ class SemanticChunker:
         Used at the end of streaming to capture remaining text
         """
         if self.current_buffer.strip():
-            # Create final chunk with remaining content
-            chunk = SemanticChunk(
-                text=self.current_buffer.strip(),
-                tokens=self.current_tokens.copy(),
-                word_count=len(self.current_buffer.strip().split()),
-                boundary_type=ChunkBoundaryType.END_OF_STREAM,
-                confidence=1.0,
-                chunk_id=f"final_chunk_{self.chunk_counter}",
-                timestamp=timestamp
-            )
+            # ✅ PREPROCESSING: Clean text before creating final chunk
+            cleaned_text = preprocess_text_for_tts(self.current_buffer)
 
-            chunk_logger.debug(f"🔄 Finalized chunk: '{chunk.text}' (END_OF_STREAM)")
+            # ✅ VALIDATION: Only create chunk if text is valid for TTS
+            if is_valid_tts_text(cleaned_text):
+                # Create final chunk with cleaned content
+                chunk = SemanticChunk(
+                    text=cleaned_text,
+                    tokens=self.current_tokens.copy(),
+                    word_count=len(cleaned_text.split()),
+                    boundary_type=ChunkBoundaryType.END_OF_STREAM,
+                    confidence=1.0,
+                    chunk_id=f"final_chunk_{self.chunk_counter}",
+                    timestamp=timestamp
+                )
 
-            # Reset buffer
-            self.current_buffer = ""
-            self.current_tokens = []
-            self.chunk_counter += 1
+                chunk_logger.debug(f"🔄 Finalized chunk: '{chunk.text}' (END_OF_STREAM)")
 
-            return chunk
+                # Reset buffer
+                self.current_buffer = ""
+                self.current_tokens = []
+                self.chunk_counter += 1
+
+                return chunk
+            else:
+                # ✅ SKIP INVALID TEXT: Log and reset buffer
+                chunk_logger.debug(f"⏭️ Skipped invalid final chunk: '{cleaned_text}' (empty/special chars only)")
+                self.current_buffer = ""
+                self.current_tokens = []
 
         return None
 
-    def reset(self):
-        """Reset the chunker state"""
-        self.current_buffer = ""
-        self.current_tokens = []
-        self.chunk_counter = 0
-    
-    def finalize_chunk(self, timestamp: float) -> Optional[SemanticChunk]:
-        """
-        Force creation of a chunk from remaining buffer content
-        Used when generation is complete
-        """
-        if not self.current_buffer.strip():
-            return None
-        
-        chunk = SemanticChunk(
-            text=self.current_buffer.strip(),
-            tokens=self.current_tokens.copy(),
-            word_count=len(self.current_buffer.strip().split()),
-            boundary_type=ChunkBoundaryType.FORCED,
-            confidence=1.0,
-            chunk_id=f"chunk_{self.chunk_counter}_final",
-            timestamp=timestamp
-        )
-        
-        chunk_logger.debug(f"🏁 Finalized chunk: '{chunk.text}'")
-        
-        # Reset state
-        self.current_buffer = ""
-        self.current_tokens = []
-        self.chunk_counter += 1
-        
-        return chunk
-    
     def reset(self):
         """Reset chunker state for new generation"""
         self.current_buffer = ""

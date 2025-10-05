@@ -254,6 +254,22 @@ class KokoroTTSModel:
         try:
             tts_logger.debug(f"🎵 Starting streaming synthesis for chunk {chunk_id}: '{text[:50]}...'")
 
+            # ✅ ENHANCED VALIDATION: Import preprocessing utilities
+            from src.utils.semantic_chunking import preprocess_text_for_tts, is_valid_tts_text
+
+            # ✅ PREPROCESSING: Clean text before synthesis
+            original_text = text
+            text = preprocess_text_for_tts(text)
+
+            # ✅ VALIDATION: Check if text is valid for TTS
+            if not is_valid_tts_text(text, min_length=1):
+                tts_logger.warning(f"⚠️ Invalid text for TTS (chunk {chunk_id}): '{original_text}' -> '{text}' (skipped)")
+                return
+
+            # Log if text was modified by preprocessing
+            if text != original_text:
+                tts_logger.debug(f"📝 Text preprocessed: '{original_text}' -> '{text}'")
+
             # Validate and preprocess text
             if not text or not text.strip():
                 tts_logger.warning(f"⚠️ Empty text provided for streaming chunk {chunk_id}")
