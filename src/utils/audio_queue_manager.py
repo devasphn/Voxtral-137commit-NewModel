@@ -5,6 +5,7 @@ Ensures no audio overlap and maintains voice consistency across streaming chunks
 import asyncio
 import logging
 import time
+import json
 from collections import deque
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
@@ -102,21 +103,24 @@ class AudioQueueManager:
         # Queue for each conversation (supports multiple concurrent conversations)
         self.conversation_queues: Dict[str, asyncio.Queue] = {}
         self.conversation_workers: Dict[str, asyncio.Task] = {}
-        
+
         # Voice consistency tracking
         self.conversation_voices: Dict[str, str] = {}
-        
+
+        # WebSocket tracking for barge-in feature
+        self.conversation_websockets: Dict[str, any] = {}
+
         # Playback state
         self.is_playing: Dict[str, bool] = {}
         self.chunks_sent: Dict[str, int] = {}
-        
+
         # Performance tracking
         self.queue_latency_ms: Dict[str, deque] = {}
         self.send_latency_ms: Dict[str, deque] = {}
-        
+
         # Global lock for thread safety
         self.manager_lock = asyncio.Lock()
-        
+
         audio_queue_logger.info("✅ AudioQueueManager initialized")
     
     async def start_conversation_queue(self, conversation_id: str, websocket) -> bool:
@@ -128,21 +132,22 @@ class AudioQueueManager:
             if conversation_id in self.conversation_queues:
                 audio_queue_logger.warning(f"⚠️ Queue already exists for {conversation_id}")
                 return False
-            
+
             # Create new queue
             self.conversation_queues[conversation_id] = asyncio.Queue()
             self.conversation_voices[conversation_id] = None
+            self.conversation_websockets[conversation_id] = websocket  # Store websocket for barge-in
             self.is_playing[conversation_id] = False
             self.chunks_sent[conversation_id] = 0
             self.queue_latency_ms[conversation_id] = deque(maxlen=100)
             self.send_latency_ms[conversation_id] = deque(maxlen=100)
-            
+
             # Start background worker
             worker = asyncio.create_task(
                 self._playback_worker(conversation_id, websocket)
             )
             self.conversation_workers[conversation_id] = worker
-            
+
             audio_queue_logger.info(f"🎵 Started audio queue for conversation {conversation_id}")
             return True
     
@@ -349,6 +354,8 @@ class AudioQueueManager:
             del self.send_latency_ms[conversation_id]
             if conversation_id in self.conversation_workers:
                 del self.conversation_workers[conversation_id]
+            if conversation_id in self.conversation_websockets:
+                del self.conversation_websockets[conversation_id]
 
             audio_queue_logger.info(f"✅ Queue stopped and cleaned up for {conversation_id}")
     

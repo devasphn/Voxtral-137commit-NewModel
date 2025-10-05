@@ -2233,8 +2233,7 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
 
         # ✅ BARGE-IN FEATURE: Check if audio is currently playing
         # If user speaks during TTS playback, interrupt immediately
-        audio_queue_manager = get_audio_queue_manager()
-        conversation_id = f"{client_id}_{chunk_id}"
+        # Note: audio_queue_manager is imported at module level (line 27)
 
         # Check if there's an active playback for this client
         # We use a simplified conversation_id based on client_id
