@@ -9,9 +9,68 @@ from collections import deque
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 import base64
+import struct
+import io
 
 # Setup logging
 audio_queue_logger = logging.getLogger("audio_queue_manager")
+
+def create_wav_header(sample_rate: int, num_channels: int, bits_per_sample: int, data_size: int) -> bytes:
+    """
+    Create a proper WAV file header
+
+    Args:
+        sample_rate: Audio sample rate (e.g., 24000)
+        num_channels: Number of audio channels (1 for mono, 2 for stereo)
+        bits_per_sample: Bits per sample (16 for int16)
+        data_size: Size of audio data in bytes
+
+    Returns:
+        WAV header bytes (44 bytes)
+    """
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+
+    # WAV file header structure
+    header = struct.pack('<4sI4s',  # RIFF chunk descriptor
+                        b'RIFF',
+                        36 + data_size,  # File size - 8
+                        b'WAVE')
+
+    # fmt sub-chunk
+    header += struct.pack('<4sIHHIIHH',
+                         b'fmt ',
+                         16,  # Subchunk1Size (16 for PCM)
+                         1,   # AudioFormat (1 for PCM)
+                         num_channels,
+                         sample_rate,
+                         byte_rate,
+                         block_align,
+                         bits_per_sample)
+
+    # data sub-chunk
+    header += struct.pack('<4sI',
+                         b'data',
+                         data_size)
+
+    return header
+
+def pcm_to_wav(pcm_data: bytes, sample_rate: int = 24000, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """
+    Convert raw PCM audio data to WAV format with proper headers
+
+    Args:
+        pcm_data: Raw PCM audio bytes (int16 format)
+        sample_rate: Audio sample rate (default: 24000 Hz)
+        num_channels: Number of channels (default: 1 for mono)
+        bits_per_sample: Bits per sample (default: 16)
+
+    Returns:
+        Complete WAV file bytes with headers
+    """
+    data_size = len(pcm_data)
+    wav_header = create_wav_header(sample_rate, num_channels, bits_per_sample, data_size)
+    return wav_header + pcm_data
 
 @dataclass
 class AudioChunk:
@@ -144,11 +203,27 @@ class AudioQueueManager:
                 
                 # Send audio chunk to client
                 send_start = time.time()
-                
+
                 try:
-                    # Encode audio to base64
-                    audio_b64 = base64.b64encode(audio_chunk.audio_data).decode('utf-8')
-                    
+                    # ✅ CRITICAL FIX: Convert raw PCM to WAV format with proper headers
+                    # The server sends raw int16 PCM data, but browsers need WAV format
+                    wav_data = pcm_to_wav(
+                        audio_chunk.audio_data,
+                        sample_rate=audio_chunk.sample_rate,
+                        num_channels=1,  # Mono audio
+                        bits_per_sample=16  # int16 format
+                    )
+
+                    # Verify WAV format
+                    if wav_data[:4] != b'RIFF' or wav_data[8:12] != b'WAVE':
+                        audio_queue_logger.error(f"❌ Invalid WAV format created for {audio_chunk.chunk_id}")
+                        continue
+
+                    audio_queue_logger.debug(f"✅ Created WAV file: {len(wav_data)} bytes (PCM: {len(audio_chunk.audio_data)} bytes, header: 44 bytes)")
+
+                    # Encode WAV to base64
+                    audio_b64 = base64.b64encode(wav_data).decode('utf-8')
+
                     # Send to WebSocket
                     import json
                     await websocket.send_text(json.dumps({
@@ -160,9 +235,10 @@ class AudioQueueManager:
                         "voice": audio_chunk.voice,
                         "text_source": audio_chunk.text_source,
                         "chunk_id": audio_chunk.chunk_id,
-                        "chunk_size_bytes": audio_chunk.chunk_size_bytes,
+                        "chunk_size_bytes": len(wav_data),  # WAV size, not PCM size
                         "timestamp": time.time(),
-                        "queue_position": self.chunks_sent[conversation_id]
+                        "queue_position": self.chunks_sent[conversation_id],
+                        "format": "wav"  # Indicate WAV format
                     }))
                     
                     self.chunks_sent[conversation_id] += 1

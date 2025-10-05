@@ -1098,16 +1098,31 @@ async def home(request: Request):
 
                     log(`🎵 Converting base64 audio for chunk ${chunkId} (${audioData.length} chars)`);
 
-                    // Convert base64 to blob with proper error handling
+                    // ✅ FIXED: Server now sends proper WAV files with headers
+                    // Just decode base64 and create blob - no need to add headers
                     const binaryString = atob(audioData);
                     const bytes = new Uint8Array(binaryString.length);
                     for (let i = 0; i < binaryString.length; i++) {
                         bytes[i] = binaryString.charCodeAt(i);
                     }
 
-                    log(`🎵 Created audio buffer: ${bytes.length} bytes`);
+                    log(`🎵 Received WAV file: ${bytes.length} bytes`);
 
-                    // Create audio blob with explicit WAV headers
+                    // Verify WAV format (should start with 'RIFF' and contain 'WAVE')
+                    const riffCheck = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+                    const waveCheck = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+
+                    if (riffCheck !== 'RIFF' || waveCheck !== 'WAVE') {
+                        log(`❌ ERROR: Invalid WAV format! RIFF: ${riffCheck}, WAVE: ${waveCheck}`, 'error');
+                        log(`   First 12 bytes: ${Array.from(bytes.slice(0, 12)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`, 'error');
+                        isPlayingAudio = false;
+                        processAudioQueue();
+                        return;
+                    }
+
+                    log(`✅ Valid WAV file detected (RIFF/WAVE headers present)`);
+
+                    // Create audio blob - server already added WAV headers
                     const audioBlob = new Blob([bytes], { type: 'audio/wav' });
                     const audioUrl = URL.createObjectURL(audioBlob);
 
@@ -2455,7 +2470,55 @@ async def initialize_models_at_startup():
                     stats = memory_stats["memory_stats"]
                     streaming_logger.info(f"💾 GPU Memory: {stats['used_vram_gb']:.2f}GB / {stats['total_vram_gb']:.2f}GB")
                     streaming_logger.info(f"💾 Voxtral: {stats['voxtral_memory_gb']:.2f}GB, Kokoro: {stats['kokoro_memory_gb']:.2f}GB")
-                
+
+                # ✅ CRITICAL: Warm-up inference to eliminate cold start
+                streaming_logger.info("🔥 Running warm-up inference to eliminate cold start...")
+                warmup_start = time.time()
+
+                try:
+                    # Create dummy audio for warm-up (1 second of silence at 16kHz)
+                    import numpy as np
+                    dummy_audio = np.zeros(16000, dtype=np.float32)
+
+                    # Warm-up Voxtral model with dummy inference
+                    voxtral_model = await unified_manager.get_voxtral_model()
+                    streaming_logger.info("   🔥 Warming up Voxtral model...")
+
+                    # Run a quick inference to load model into GPU memory
+                    warmup_count = 0
+                    async for chunk in voxtral_model.process_chunked_streaming(
+                        dummy_audio,
+                        prompt=None,
+                        chunk_id="warmup",
+                        mode="chunked_streaming"
+                    ):
+                        warmup_count += 1
+                        # Just consume the chunks, don't process them
+                        if warmup_count >= 3:  # Process a few chunks then stop
+                            break
+
+                    # Warm-up Kokoro TTS model
+                    kokoro_model = await unified_manager.get_kokoro_model()
+                    streaming_logger.info("   🔥 Warming up Kokoro TTS model...")
+
+                    # Run a quick TTS synthesis
+                    warmup_tts_count = 0
+                    async for tts_chunk in kokoro_model.synthesize_speech_streaming(
+                        "Hello",
+                        voice="hm_omega",
+                        chunk_id="warmup_tts"
+                    ):
+                        warmup_tts_count += 1
+                        if warmup_tts_count >= 2:  # Process a couple chunks then stop
+                            break
+
+                    warmup_time = (time.time() - warmup_start) * 1000
+                    streaming_logger.info(f"✅ Warm-up complete in {warmup_time:.1f}ms - Models ready for ultra-low latency!")
+
+                except Exception as warmup_error:
+                    streaming_logger.warning(f"⚠️ Warm-up inference failed (non-critical): {warmup_error}")
+                    # Don't fail startup if warm-up fails
+
             else:
                 raise Exception("Unified model manager initialization failed")
         else:
