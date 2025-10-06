@@ -532,7 +532,7 @@ async def home(request: Request):
         let currentConversationId = null;
         let speechToSpeechActive = false;
 
-        // ULTRA-LOW LATENCY: Enhanced configuration for continuous speech capture
+        // ✅ CRITICAL FIX: Ultra-low latency streaming configuration
         const CHUNK_SIZE = 2048;  // OPTIMIZED: Reduced chunk size for lower latency
         const CHUNK_INTERVAL = 50;  // OPTIMIZED: Faster processing interval (was 100ms)
         const SAMPLE_RATE = 16000;
@@ -540,6 +540,11 @@ async def home(request: Request):
         const SILENCE_THRESHOLD = 0.005;  // OPTIMIZED: Lower threshold for faster detection
         const MIN_SPEECH_DURATION = 200;  // OPTIMIZED: Reduced minimum speech duration (was 500ms)
         const END_OF_SPEECH_SILENCE = 800;  // OPTIMIZED: Faster silence detection (was 1500ms)
+
+        // ✅ CRITICAL FIX: Streaming VAD configuration to eliminate 15-second delay
+        const MAX_BUFFER_SIZE = SAMPLE_RATE * 2;  // 2 seconds max buffer
+        const MIN_CHUNK_SIZE = SAMPLE_RATE * 0.5;  // 0.5 seconds min chunk for streaming
+        const STREAMING_MODE = true;  // Enable streaming mode (send chunks immediately)
         
         function log(message, type = 'info') {
             console.log(`[Voxtral VAD] ${message}`);
@@ -1261,26 +1266,56 @@ async def home(request: Request):
             }
         }
 
+        // ✅ CRITICAL FIX: Minimum buffer size for smooth playback
+        const MIN_AUDIO_BUFFER_SIZE = 2;  // Wait for at least 2 chunks before starting
+        let bufferingStartTime = null;
+        const MAX_BUFFER_WAIT = 500;  // Max 500ms wait for buffering
+
         async function processAudioQueue() {
-            if (isPlayingAudio || audioQueue.length === 0) {
+            if (isPlayingAudio) {
                 return;
             }
 
+            // ✅ CRITICAL FIX: Wait for minimum buffer or timeout to eliminate gaps
+            if (audioQueue.length < MIN_AUDIO_BUFFER_SIZE && audioQueue.length > 0) {
+                if (!bufferingStartTime) {
+                    bufferingStartTime = Date.now();
+                    log(`🔄 Buffering audio chunks (${audioQueue.length}/${MIN_AUDIO_BUFFER_SIZE})...`);
+
+                    // Check again after a short delay
+                    setTimeout(() => processAudioQueue(), 50);
+                    return;
+                } else if (Date.now() - bufferingStartTime < MAX_BUFFER_WAIT) {
+                    // Still within buffer wait time
+                    setTimeout(() => processAudioQueue(), 50);
+                    return;
+                } else {
+                    // Timeout reached, start playing with what we have
+                    log(`⚠️ Buffer timeout reached, starting playback with ${audioQueue.length} chunks`);
+                }
+            }
+
+            if (audioQueue.length === 0) {
+                bufferingStartTime = null;
+                return;
+            }
+
+            bufferingStartTime = null;  // Reset buffering timer
             isPlayingAudio = true;
+
+            // ✅ CRITICAL FIX: Pre-load ALL chunks in queue before starting
+            log(`📥 Pre-loading ${audioQueue.length} chunks before playback...`);
+            for (let i = 0; i < audioQueue.length; i++) {
+                if (!audioQueue[i]._preloadedAudio) {
+                    preloadAudioItem(audioQueue[i]);
+                }
+            }
 
             while (audioQueue.length > 0) {
                 const audioItem = audioQueue.shift();
 
                 try {
                     log(`🎵 Processing audio chunk ${audioItem.chunkId} from queue`);
-
-                    // ✅ CRITICAL FIX: Pre-load next chunk while playing current
-                    if (audioQueue.length > 0) {
-                        const nextItem = audioQueue[0];
-                        if (!nextItem._preloadedAudio) {
-                            preloadAudioItem(nextItem);  // Async pre-loading
-                        }
-                    }
 
                     await playAudioItem(audioItem);
                     log(`✅ Completed playing audio chunk ${audioItem.chunkId}`);
@@ -1626,6 +1661,14 @@ async def home(request: Request):
                             }
                         }
                         lastSpeechTime = now;
+
+                        // ✅ CRITICAL FIX: Stream chunks immediately to eliminate 15-second delay
+                        // Send chunks when buffer reaches minimum size (don't wait for silence)
+                        if (STREAMING_MODE && continuousAudioBuffer.length >= MIN_CHUNK_SIZE) {
+                            log(`🎤 Streaming audio chunk (${continuousAudioBuffer.length} samples) - immediate mode`);
+                            sendCompleteUtterance(new Float32Array(continuousAudioBuffer));
+                            continuousAudioBuffer = [];
+                        }
                     } else {
                         if (isSpeechActive && !silenceStartTime) {
                             // Silence started after speech
@@ -1634,22 +1677,32 @@ async def home(request: Request):
                         }
                     }
 
-                    // Check if we should process accumulated speech
+                    // ✅ MODIFIED: Only reset on extended silence (not send audio in streaming mode)
                     if (isSpeechActive && silenceStartTime &&
-                        (now - silenceStartTime >= END_OF_SPEECH_SILENCE) &&
-                        (lastSpeechTime - speechStartTime >= MIN_SPEECH_DURATION)) {
+                        (now - silenceStartTime >= END_OF_SPEECH_SILENCE * 2)) {
 
-                        // Process the complete utterance
-                        log(`Processing complete utterance: ${continuousAudioBuffer.length} samples, ${(lastSpeechTime - speechStartTime)}ms duration`);
-                        sendCompleteUtterance(new Float32Array(continuousAudioBuffer));
+                        log(`🔇 Extended silence detected - resetting VAD state`);
+
+                        // Send any remaining audio
+                        if (continuousAudioBuffer.length > 0) {
+                            log(`🎤 Sending final audio chunk (${continuousAudioBuffer.length} samples)`);
+                            sendCompleteUtterance(new Float32Array(continuousAudioBuffer));
+                            continuousAudioBuffer = [];
+                        }
 
                         // Reset for next utterance
-                        continuousAudioBuffer = [];
                         isSpeechActive = false;
                         speechStartTime = null;
                         lastSpeechTime = null;
                         silenceStartTime = null;
                         pendingResponse = true;  // Prevent processing until response received
+                    }
+
+                    // ✅ CRITICAL FIX: Prevent buffer overflow
+                    if (continuousAudioBuffer.length > MAX_BUFFER_SIZE) {
+                        log(`⚠️ Buffer overflow protection - sending ${continuousAudioBuffer.length} samples`);
+                        sendCompleteUtterance(new Float32Array(continuousAudioBuffer));
+                        continuousAudioBuffer = [];
                     }
 
                     // ULTRA-LOW LATENCY: Prevent buffer from growing too large (max 5 seconds for lower latency)
@@ -1817,13 +1870,16 @@ async def home(request: Request):
             return btoa(binary);
         }
         
-        // Initialize on page load
+        // ✅ CRITICAL FIX: Initialize on page load to prevent ReferenceError
+        // Move all initialization inside load event to ensure DOM is ready
         window.addEventListener('load', () => {
             detectEnvironment();
+            updateMode();  // ✅ MOVED INSIDE load event
+            updateVoiceSettings();  // ✅ MOVED INSIDE load event
             updateStatus('Ready to connect for conversation with VAD');
             log('Conversational application with VAD initialized');
         });
-        
+
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
             if (isStreaming) {
@@ -1833,10 +1889,6 @@ async def home(request: Request):
                 ws.close();
             }
         });
-
-        // Initialize the interface
-        updateMode();
-        updateVoiceSettings();
     </script>
 </body>
 </html>
