@@ -13,6 +13,39 @@ from enum import Enum
 chunk_logger = logging.getLogger("semantic_chunking")
 chunk_logger.setLevel(logging.INFO)
 
+def preprocess_special_characters_for_tts(text: str) -> str:
+    """
+    ✅ CRITICAL FIX: Optimize special characters for faster TTS processing
+
+    Special characters cause phonemizer overhead. This function normalizes them
+    to reduce processing time while maintaining natural prosody.
+    """
+    if not text:
+        return ""
+
+    # Normalize quotation marks (reduce phonemizer complexity)
+    text = text.replace('"', '')  # Remove quotes entirely
+    text = text.replace("'", '')  # Remove single quotes
+    text = text.replace(''', '')  # Remove smart quotes
+    text = text.replace(''', '')
+    text = text.replace('"', '')
+    text = text.replace('"', '')
+
+    # Normalize hyphens (major performance bottleneck)
+    text = text.replace('-', ' ')  # Convert hyphens to spaces
+    text = text.replace('—', ' ')  # Convert em-dashes to spaces
+    text = text.replace('–', ' ')  # Convert en-dashes to spaces
+
+    # Normalize multiple exclamation/question marks
+    text = re.sub(r'!{2,}', '!', text)  # Multiple !!! -> single !
+    text = re.sub(r'\?{2,}', '?', text)  # Multiple ??? -> single ?
+
+    # Remove excessive whitespace created by replacements
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+
+    return text
+
 def preprocess_text_for_tts(text: str, enhance_prosody: bool = True) -> str:
     """
     ✅ ENHANCED: Preprocess text to remove markdown formatting and enhance prosody
@@ -55,6 +88,9 @@ def preprocess_text_for_tts(text: str, enhance_prosody: bool = True) -> str:
 
     # Remove multiple spaces
     text = re.sub(r'\s+', ' ', text)
+
+    # ✅ CRITICAL FIX: Optimize special characters BEFORE prosody enhancement
+    text = preprocess_special_characters_for_tts(text)
 
     # ✅ NEW: Enhance prosody if requested
     if enhance_prosody:

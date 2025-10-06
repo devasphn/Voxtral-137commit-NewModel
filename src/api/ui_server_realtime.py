@@ -1238,38 +1238,89 @@ async def home(request: Request):
         }
 
         // ✅ CRITICAL FIX: Pre-load next audio chunk for smoother playback
+        // ✅ CRITICAL FIX: Audio element pool to reduce creation overhead
+        const AUDIO_POOL_SIZE = 5;
+        const audioElementPool = [];
+        let poolInitialized = false;
+
+        function initializeAudioPool() {
+            if (poolInitialized) return;
+
+            log(`🎵 Initializing audio element pool (size: ${AUDIO_POOL_SIZE})`);
+            for (let i = 0; i < AUDIO_POOL_SIZE; i++) {
+                const audio = new Audio();
+                audio.preload = 'auto';
+                audioElementPool.push(audio);
+            }
+            poolInitialized = true;
+            log(`✅ Audio pool initialized with ${AUDIO_POOL_SIZE} elements`);
+        }
+
+        function getAudioElement() {
+            if (audioElementPool.length > 0) {
+                const audio = audioElementPool.pop();
+                log(`📥 Reusing audio element from pool (${audioElementPool.length} remaining)`);
+                return audio;
+            }
+            log(`⚠️ Pool empty, creating new audio element`);
+            const audio = new Audio();
+            audio.preload = 'auto';
+            return audio;
+        }
+
+        function returnAudioElement(audio) {
+            if (audioElementPool.length < AUDIO_POOL_SIZE) {
+                // Reset audio element
+                audio.pause();
+                audio.currentTime = 0;
+                audio.src = '';
+                audioElementPool.push(audio);
+                log(`📤 Returned audio element to pool (${audioElementPool.length} available)`);
+            }
+        }
+
+        // ✅ CRITICAL FIX: Enhanced pre-loading with aggressive base64 decoding
         function preloadAudioItem(audioItem) {
             try {
                 const { audioData } = audioItem;
+
+                // ✅ CRITICAL FIX: Decode base64 IMMEDIATELY (not during playback)
+                const decodeStart = performance.now();
                 const binaryString = atob(audioData);
                 const bytes = new Uint8Array(binaryString.length);
                 for (let i = 0; i < binaryString.length; i++) {
                     bytes[i] = binaryString.charCodeAt(i);
                 }
+                const decodeTime = performance.now() - decodeStart;
+
                 const audioBlob = new Blob([bytes], { type: 'audio/wav' });
                 const audioUrl = URL.createObjectURL(audioBlob);
 
-                // Create and pre-load audio element
-                const audio = new Audio();
-                audio.preload = 'auto';
+                // ✅ CRITICAL FIX: Use pooled audio element
+                const audio = getAudioElement();
                 audio.src = audioUrl;
                 audio.load();  // Start loading immediately
 
-                // ✅ CRITICAL FIX: Store pre-loaded audio, URL, and blob for debugging
+                // ✅ CRITICAL FIX: Store ALL pre-loaded data
                 audioItem._preloadedAudio = audio;
                 audioItem._preloadedUrl = audioUrl;
                 audioItem._preloadedBlob = audioBlob;
+                audioItem._preloadedBytes = bytes;  // ✅ NEW: Store decoded bytes
+                audioItem._decodeTime = decodeTime;  // ✅ NEW: Track decode time
+                audioItem._preloadComplete = true;  // ✅ NEW: Flag for verification
 
-                log(`📥 Pre-loaded audio chunk ${audioItem.chunkId}`);
+                log(`📥 Pre-loaded audio chunk ${audioItem.chunkId} (decode: ${decodeTime.toFixed(1)}ms)`);
             } catch (error) {
                 log(`⚠️ Pre-load failed for ${audioItem.chunkId}: ${error}`);
+                audioItem._preloadComplete = false;
             }
         }
 
-        // ✅ CRITICAL FIX: Minimum buffer size for smooth playback
-        const MIN_AUDIO_BUFFER_SIZE = 2;  // Wait for at least 2 chunks before starting
+        // ✅ CRITICAL FIX: Increased buffer size for smoother playback
+        const MIN_AUDIO_BUFFER_SIZE = 4;  // ⬆️ Increased from 2 to 4
         let bufferingStartTime = null;
-        const MAX_BUFFER_WAIT = 500;  // Max 500ms wait for buffering
+        const MAX_BUFFER_WAIT = 800;  // ⬆️ Increased from 500ms to 800ms
+        const PRELOAD_AHEAD = 2;  // ✅ NEW: Pre-load 2 chunks ahead
 
         async function processAudioQueue() {
             if (isPlayingAudio) {
@@ -1303,12 +1354,23 @@ async def home(request: Request):
             bufferingStartTime = null;  // Reset buffering timer
             isPlayingAudio = true;
 
+            // ✅ CRITICAL FIX: Initialize audio pool if not already done
+            initializeAudioPool();
+
             // ✅ CRITICAL FIX: Pre-load ALL chunks in queue before starting
             log(`📥 Pre-loading ${audioQueue.length} chunks before playback...`);
             for (let i = 0; i < audioQueue.length; i++) {
-                if (!audioQueue[i]._preloadedAudio) {
+                if (!audioQueue[i]._preloadComplete) {
                     preloadAudioItem(audioQueue[i]);
                 }
+            }
+
+            // ✅ NEW: Verify pre-loading success
+            const preloadedCount = audioQueue.filter(item => item._preloadComplete).length;
+            log(`✅ Pre-loading complete: ${preloadedCount}/${audioQueue.length} chunks ready`);
+
+            if (preloadedCount < audioQueue.length) {
+                log(`⚠️ Some chunks failed to pre-load, playback may have gaps`);
             }
 
             while (audioQueue.length > 0) {
@@ -1340,23 +1402,26 @@ async def home(request: Request):
                     // ✅ FIX: Extract all properties including metadata and sampleRate
                     const { chunkId, audioData, metadata = {}, voice, sampleRate = 24000 } = audioItem;
 
-                    // ✅ CRITICAL FIX: Use pre-loaded audio if available
+                    // ✅ CRITICAL FIX: ALWAYS use pre-loaded data if available
                     let audio, audioUrl, audioBlob;
-                    if (audioItem._preloadedAudio && audioItem._preloadedUrl) {
-                        log(`🎵 Using pre-loaded audio for chunk ${chunkId}`);
+                    if (audioItem._preloadComplete && audioItem._preloadedAudio) {
+                        log(`🎵 Using pre-loaded audio for chunk ${chunkId} (decode time: ${audioItem._decodeTime.toFixed(1)}ms)`);
                         audio = audioItem._preloadedAudio;
                         audioUrl = audioItem._preloadedUrl;
-                        audioBlob = audioItem._preloadedBlob;  // Use pre-loaded blob if available
+                        audioBlob = audioItem._preloadedBlob;
                     } else {
-                        log(`🎵 Converting base64 audio for chunk ${chunkId} (${audioData.length} chars)`);
+                        // ❌ FALLBACK: This should RARELY happen
+                        log(`⚠️ PRE-LOAD FAILED - Converting base64 audio for chunk ${chunkId} (${audioData.length} chars)`);
 
                         // ✅ FIXED: Server now sends proper WAV files with headers
                         // Just decode base64 and create blob - no need to add headers
+                        const decodeStart = performance.now();
                         const binaryString = atob(audioData);
                         const bytes = new Uint8Array(binaryString.length);
                         for (let i = 0; i < binaryString.length; i++) {
                             bytes[i] = binaryString.charCodeAt(i);
                         }
+                        const decodeTime = performance.now() - decodeStart;
 
                         log(`🎵 Received WAV file: ${bytes.length} bytes`);
 
@@ -1378,11 +1443,14 @@ async def home(request: Request):
                         audioBlob = new Blob([bytes], { type: 'audio/wav' });
                         audioUrl = URL.createObjectURL(audioBlob);
 
-                        // ✅ CRITICAL FIX: Create audio element with immediate playback configuration
-                        audio = new Audio();
-                        audio.preload = 'auto';  // Preload entire audio for immediate playback
+                        // ✅ CRITICAL FIX: Use pooled audio element (not create new)
+                        audio = getAudioElement();
+                        audio.src = audioUrl;
+                        audio.load();
                         audio.volume = 1.0;
                         audio.autoplay = false;  // We'll control playback manually for better timing
+
+                        log(`⚠️ Fallback decode took ${decodeTime.toFixed(1)}ms`);
                     }
 
                     // ✅ FIX: Enhanced audio debugging with proper metadata and sample rate
@@ -1428,6 +1496,8 @@ async def home(request: Request):
                         log(`✅ Finished playing audio chunk ${chunkId} - Total duration: ${audio.duration}s`);
                         URL.revokeObjectURL(audioUrl);
                         currentAudio = null;
+                        // ✅ CRITICAL FIX: Return audio element to pool
+                        returnAudioElement(audio);
                         resolve();
                     });
 
@@ -1442,6 +1512,8 @@ async def home(request: Request):
                         log(`❌ Audio element state - src: ${audio.src.substring(0, 50)}..., duration: ${audio.duration}`);
                         URL.revokeObjectURL(audioUrl);
                         currentAudio = null;
+                        // ✅ CRITICAL FIX: Return audio element to pool even on error
+                        returnAudioElement(audio);
                         reject(new Error(`Audio playback failed: ${JSON.stringify(errorDetails)}`));
                     });
 
@@ -1449,6 +1521,8 @@ async def home(request: Request):
                         log(`⚠️ Audio playback aborted for chunk ${chunkId}`);
                         URL.revokeObjectURL(audioUrl);
                         currentAudio = null;
+                        // ✅ CRITICAL FIX: Return audio element to pool on abort
+                        returnAudioElement(audio);
                         resolve(); // Don't reject on abort, just continue
                     });
 
@@ -2591,7 +2665,7 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                                         audio_chunk_obj = AudioChunk(
                                             audio_data=audio_data if isinstance(audio_data, bytes) else audio_data.astype(np.int16).tobytes(),
                                             chunk_id=tts_chunk.get('chunk_id', f"{chunk_id}_word_{word_count}_audio_{tts_chunk.get('chunk_index', 0)}"),
-                                            voice="hm_omega",
+                                            voice="af_heart",  # ✅ FIXED: Use English voice (was hm_omega Hindi)
                                             sample_rate=tts_chunk.get('sample_rate', 24000),
                                             chunk_index=tts_chunk.get('chunk_index', 0),
                                             timestamp=time.time(),
@@ -2696,7 +2770,7 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                                 tts_timing_id = performance_monitor.start_timing("kokoro_generation", {
                                     "chunk_id": chunk_id,
                                     "text_length": len(response),
-                                    "voice": "hm_omega"  # Kokoro Hindi voice
+                                    "voice": "af_heart"  # ✅ FIXED: English voice (was hm_omega Hindi)
                                 })
 
                                 # ✅ CRITICAL FIX: Use English voice to match Voxtral output language
@@ -2760,12 +2834,15 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                                     # Calculate audio duration from actual audio samples
                                     audio_duration_ms = (len(audio_data) / sample_rate) * 1000
 
+                                    # ✅ CRITICAL FIX: Use actual voice from TTS synthesis (not hardcoded)
+                                    actual_voice = result.get('voice_used', 'af_heart')
+
                                     # Send audio response
                                     await websocket.send_text(json.dumps({
                                         "type": "audio_response",
                                         "audio_data": audio_b64,
                                         "chunk_id": chunk_id,
-                                        "voice": "hm_omega",  # Kokoro Hindi voice
+                                        "voice": actual_voice,  # ✅ FIXED: Use dynamic voice from TTS
                                         "format": "wav",
                                         "metadata": {
                                             "audio_duration_ms": audio_duration_ms,
@@ -2773,7 +2850,8 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                                             "sample_rate": sample_rate,
                                             "channels": 1,
                                             "format": "WAV",
-                                            "subtype": "PCM_16"
+                                            "subtype": "PCM_16",
+                                            "voice_used": actual_voice  # ✅ NEW: Include in metadata
                                         }
                                     }))
 

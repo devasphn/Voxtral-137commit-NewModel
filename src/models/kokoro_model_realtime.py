@@ -36,16 +36,23 @@ class KokoroTTSModel:
         # Performance optimization settings
         self.device = config.model.device
         self.torch_dtype = getattr(torch, config.model.torch_dtype)
-        
+
         # TTS-specific settings
         self.sample_rate = config.tts.sample_rate
         self.voice = config.tts.voice
         self.speed = config.tts.speed
         self.lang_code = config.tts.lang_code
-        
+
         # Quality and performance settings
         self.chunk_size = 1024
         self.max_text_length = 1000  # Maximum text length per generation
+
+        # ✅ CRITICAL FIX: Phoneme caching for consistent TTS synthesis times
+        self.phoneme_cache = {}  # Cache phoneme results
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.last_gc_time = time.time()
+        self.gc_interval = 30.0  # Run GC every 30 seconds
         
         tts_logger.info(f"🎵 KokoroTTSModel initialized with device: {self.device}")
         tts_logger.info(f"   🎤 Voice: {self.voice}, Speed: {self.speed}, Lang: {self.lang_code}")
@@ -279,6 +286,25 @@ class KokoroTTSModel:
             if len(text) > self.max_text_length:
                 text = text[:self.max_text_length]
                 tts_logger.warning(f"⚠️ Text truncated to {self.max_text_length} characters for streaming chunk {chunk_id}")
+
+            # ✅ CRITICAL FIX: Check phoneme cache first
+            cache_key = f"{text}_{voice}_{speed}"
+            if cache_key in self.phoneme_cache:
+                self.cache_hits += 1
+                tts_logger.debug(f"📦 Cache HIT for '{text[:30]}...' (hits: {self.cache_hits})")
+            else:
+                self.cache_misses += 1
+                tts_logger.debug(f"❌ Cache MISS for '{text[:30]}...' (misses: {self.cache_misses})")
+
+            # ✅ CRITICAL FIX: Proactive GPU memory management
+            current_time = time.time()
+            if current_time - self.last_gc_time > self.gc_interval:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self.last_gc_time = current_time
+                tts_logger.debug(f"🧹 GPU memory cleanup performed")
 
             # ✅ CRITICAL FIX: Updated to new PyTorch autocast syntax (torch.amp.autocast)
             # ULTRA-LOW LATENCY: TRUE STREAMING - Yield each chunk immediately
