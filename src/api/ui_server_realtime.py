@@ -1250,9 +1250,10 @@ async def home(request: Request):
                 audio.src = audioUrl;
                 audio.load();  // Start loading immediately
 
-                // Store pre-loaded audio
+                // ✅ CRITICAL FIX: Store pre-loaded audio, URL, and blob for debugging
                 audioItem._preloadedAudio = audio;
                 audioItem._preloadedUrl = audioUrl;
+                audioItem._preloadedBlob = audioBlob;
 
                 log(`📥 Pre-loaded audio chunk ${audioItem.chunkId}`);
             } catch (error) {
@@ -1305,11 +1306,12 @@ async def home(request: Request):
                     const { chunkId, audioData, metadata = {}, voice, sampleRate = 24000 } = audioItem;
 
                     // ✅ CRITICAL FIX: Use pre-loaded audio if available
-                    let audio, audioUrl;
+                    let audio, audioUrl, audioBlob;
                     if (audioItem._preloadedAudio && audioItem._preloadedUrl) {
                         log(`🎵 Using pre-loaded audio for chunk ${chunkId}`);
                         audio = audioItem._preloadedAudio;
                         audioUrl = audioItem._preloadedUrl;
+                        audioBlob = audioItem._preloadedBlob;  // Use pre-loaded blob if available
                     } else {
                         log(`🎵 Converting base64 audio for chunk ${chunkId} (${audioData.length} chars)`);
 
@@ -1338,7 +1340,7 @@ async def home(request: Request):
                         log(`✅ Valid WAV file detected (RIFF/WAVE headers present)`);
 
                         // Create audio blob - server already added WAV headers
-                        const audioBlob = new Blob([bytes], { type: 'audio/wav' });
+                        audioBlob = new Blob([bytes], { type: 'audio/wav' });
                         audioUrl = URL.createObjectURL(audioBlob);
 
                         // ✅ CRITICAL FIX: Create audio element with immediate playback configuration
@@ -1350,7 +1352,9 @@ async def home(request: Request):
 
                     // ✅ FIX: Enhanced audio debugging with proper metadata and sample rate
                     log(`🎵 Audio metadata: ${JSON.stringify(metadata)}`);
-                    log(`🎵 Audio blob size: ${audioBlob.size} bytes, type: ${audioBlob.type}`);
+                    if (audioBlob) {
+                        log(`🎵 Audio blob size: ${audioBlob.size} bytes, type: ${audioBlob.type}`);
+                    }
                     log(`🎵 Sample rate: ${sampleRate}Hz, Voice: ${voice}`);
 
                     // Store reference for cleanup
