@@ -1270,12 +1270,22 @@ async def home(request: Request):
 
         function returnAudioElement(audio) {
             if (audioElementPool.length < AUDIO_POOL_SIZE) {
-                // Reset audio element
-                audio.pause();
-                audio.currentTime = 0;
-                audio.src = '';
-                audioElementPool.push(audio);
-                log(`📤 Returned audio element to pool (${audioElementPool.length} available)`);
+                // ✅ CRITICAL FIX: Properly clean audio element before returning to pool
+                try {
+                    audio.pause();
+                    audio.currentTime = 0;
+                    audio.src = '';
+
+                    // ✅ CRITICAL FIX: Remove ALL event listeners to prevent "Empty src" errors
+                    // Clone the audio element to remove all event listeners
+                    const cleanAudio = audio.cloneNode(false);
+                    cleanAudio.preload = 'auto';
+
+                    audioElementPool.push(cleanAudio);
+                    log(`📤 Returned cleaned audio element to pool (${audioElementPool.length} available)`);
+                } catch (error) {
+                    log(`⚠️ Error returning audio element to pool: ${error}`);
+                }
             }
         }
 
@@ -1323,7 +1333,9 @@ async def home(request: Request):
         const PRELOAD_AHEAD = 2;  // ✅ NEW: Pre-load 2 chunks ahead
 
         async function processAudioQueue() {
+            // ✅ CRITICAL FIX: Prevent multiple simultaneous processAudioQueue() calls
             if (isPlayingAudio) {
+                log(`⚠️ Already playing audio, skipping processAudioQueue() call`);
                 return;
             }
 
@@ -1526,11 +1538,16 @@ async def home(request: Request):
                         resolve(); // Don't reject on abort, just continue
                     });
 
-                    // ✅ CRITICAL FIX: Set source and start playback IMMEDIATELY
-                    audio.src = audioUrl;
+                    // ❌ REMOVED: Duplicate audio.src assignment - already set during pre-load or fallback
+                    // The audio element already has src set at line 1301 (pre-load) or 1448 (fallback)
+                    // Setting it again here causes the audio to reload and breaks pre-loading!
 
-                    // ✅ CRITICAL FIX: Load audio data immediately
-                    audio.load();
+                    // ✅ ONLY reload if src is not set (shouldn't happen with proper pre-loading)
+                    if (!audio.src || audio.src === '') {
+                        log(`⚠️ WARNING: Audio src not set, setting now for chunk ${chunkId}`);
+                        audio.src = audioUrl;
+                        audio.load();
+                    }
 
                     // ✅ CRITICAL FIX: Start playback as soon as possible with aggressive retry logic
                     const playWithRetry = async (retries = 5) => {  // Increased retries
