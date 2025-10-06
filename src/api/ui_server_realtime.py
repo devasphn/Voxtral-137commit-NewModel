@@ -545,8 +545,8 @@ async def home(request: Request):
             console.log(`[Voxtral VAD] ${message}`);
         }
 
-        // ULTRA-LOW LATENCY: Enhanced VAD function for continuous speech detection
-        function detectSpeechInBuffer(audioData) {
+        // ✅ CRITICAL FIX: Enhanced VAD function with echo detection to prevent audio feedback loop
+        function detectSpeechInBuffer(audioData, isPlaybackActive = false) {
             if (!audioData || audioData.length === 0) return false;
 
             // OPTIMIZED: Calculate RMS energy with reduced computation
@@ -564,8 +564,14 @@ async def home(request: Request):
                 if (abs > maxAmplitude) maxAmplitude = abs;
             }
 
-            // OPTIMIZED: Speech detected with lower thresholds for faster detection
-            const hasSpeech = rms > SILENCE_THRESHOLD && maxAmplitude > 0.001;
+            // ✅ CRITICAL FIX: Adjust threshold based on playback state to prevent echo detection
+            // During playback, use 3x higher threshold to avoid detecting TTS output as user speech
+            const threshold = isPlaybackActive ?
+                SILENCE_THRESHOLD * 3 :  // 3x higher during playback (echo prevention)
+                SILENCE_THRESHOLD;        // Normal threshold when not playing
+
+            const amplitudeThreshold = isPlaybackActive ? 0.01 : 0.001;
+            const hasSpeech = rms > threshold && maxAmplitude > amplitudeThreshold;
 
             return hasSpeech;
         }
@@ -1226,6 +1232,34 @@ async def home(request: Request):
             }
         }
 
+        // ✅ CRITICAL FIX: Pre-load next audio chunk for smoother playback
+        function preloadAudioItem(audioItem) {
+            try {
+                const { audioData } = audioItem;
+                const binaryString = atob(audioData);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                const audioBlob = new Blob([bytes], { type: 'audio/wav' });
+                const audioUrl = URL.createObjectURL(audioBlob);
+
+                // Create and pre-load audio element
+                const audio = new Audio();
+                audio.preload = 'auto';
+                audio.src = audioUrl;
+                audio.load();  // Start loading immediately
+
+                // Store pre-loaded audio
+                audioItem._preloadedAudio = audio;
+                audioItem._preloadedUrl = audioUrl;
+
+                log(`📥 Pre-loaded audio chunk ${audioItem.chunkId}`);
+            } catch (error) {
+                log(`⚠️ Pre-load failed for ${audioItem.chunkId}: ${error}`);
+            }
+        }
+
         async function processAudioQueue() {
             if (isPlayingAudio || audioQueue.length === 0) {
                 return;
@@ -1238,6 +1272,15 @@ async def home(request: Request):
 
                 try {
                     log(`🎵 Processing audio chunk ${audioItem.chunkId} from queue`);
+
+                    // ✅ CRITICAL FIX: Pre-load next chunk while playing current
+                    if (audioQueue.length > 0) {
+                        const nextItem = audioQueue[0];
+                        if (!nextItem._preloadedAudio) {
+                            preloadAudioItem(nextItem);  // Async pre-loading
+                        }
+                    }
+
                     await playAudioItem(audioItem);
                     log(`✅ Completed playing audio chunk ${audioItem.chunkId}`);
                 } catch (error) {
@@ -1261,41 +1304,49 @@ async def home(request: Request):
                     // ✅ FIX: Extract all properties including metadata and sampleRate
                     const { chunkId, audioData, metadata = {}, voice, sampleRate = 24000 } = audioItem;
 
-                    log(`🎵 Converting base64 audio for chunk ${chunkId} (${audioData.length} chars)`);
+                    // ✅ CRITICAL FIX: Use pre-loaded audio if available
+                    let audio, audioUrl;
+                    if (audioItem._preloadedAudio && audioItem._preloadedUrl) {
+                        log(`🎵 Using pre-loaded audio for chunk ${chunkId}`);
+                        audio = audioItem._preloadedAudio;
+                        audioUrl = audioItem._preloadedUrl;
+                    } else {
+                        log(`🎵 Converting base64 audio for chunk ${chunkId} (${audioData.length} chars)`);
 
-                    // ✅ FIXED: Server now sends proper WAV files with headers
-                    // Just decode base64 and create blob - no need to add headers
-                    const binaryString = atob(audioData);
-                    const bytes = new Uint8Array(binaryString.length);
-                    for (let i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
+                        // ✅ FIXED: Server now sends proper WAV files with headers
+                        // Just decode base64 and create blob - no need to add headers
+                        const binaryString = atob(audioData);
+                        const bytes = new Uint8Array(binaryString.length);
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i);
+                        }
+
+                        log(`🎵 Received WAV file: ${bytes.length} bytes`);
+
+                        // Verify WAV format (should start with 'RIFF' and contain 'WAVE')
+                        const riffCheck = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+                        const waveCheck = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+
+                        if (riffCheck !== 'RIFF' || waveCheck !== 'WAVE') {
+                            log(`❌ ERROR: Invalid WAV format! RIFF: ${riffCheck}, WAVE: ${waveCheck}`, 'error');
+                            log(`   First 12 bytes: ${Array.from(bytes.slice(0, 12)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`, 'error');
+                            isPlayingAudio = false;
+                            processAudioQueue();
+                            return;
+                        }
+
+                        log(`✅ Valid WAV file detected (RIFF/WAVE headers present)`);
+
+                        // Create audio blob - server already added WAV headers
+                        const audioBlob = new Blob([bytes], { type: 'audio/wav' });
+                        audioUrl = URL.createObjectURL(audioBlob);
+
+                        // ✅ CRITICAL FIX: Create audio element with immediate playback configuration
+                        audio = new Audio();
+                        audio.preload = 'auto';  // Preload entire audio for immediate playback
+                        audio.volume = 1.0;
+                        audio.autoplay = false;  // We'll control playback manually for better timing
                     }
-
-                    log(`🎵 Received WAV file: ${bytes.length} bytes`);
-
-                    // Verify WAV format (should start with 'RIFF' and contain 'WAVE')
-                    const riffCheck = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
-                    const waveCheck = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
-
-                    if (riffCheck !== 'RIFF' || waveCheck !== 'WAVE') {
-                        log(`❌ ERROR: Invalid WAV format! RIFF: ${riffCheck}, WAVE: ${waveCheck}`, 'error');
-                        log(`   First 12 bytes: ${Array.from(bytes.slice(0, 12)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`, 'error');
-                        isPlayingAudio = false;
-                        processAudioQueue();
-                        return;
-                    }
-
-                    log(`✅ Valid WAV file detected (RIFF/WAVE headers present)`);
-
-                    // Create audio blob - server already added WAV headers
-                    const audioBlob = new Blob([bytes], { type: 'audio/wav' });
-                    const audioUrl = URL.createObjectURL(audioBlob);
-
-                    // ✅ CRITICAL FIX: Create audio element with immediate playback configuration
-                    const audio = new Audio();
-                    audio.preload = 'auto';  // Preload entire audio for immediate playback
-                    audio.volume = 1.0;
-                    audio.autoplay = false;  // We'll control playback manually for better timing
 
                     // ✅ FIX: Enhanced audio debugging with proper metadata and sample rate
                     log(`🎵 Audio metadata: ${JSON.stringify(metadata)}`);
@@ -1519,22 +1570,26 @@ async def home(request: Request):
                     // Add to continuous buffer
                     continuousAudioBuffer.push(...inputData);
 
-                    // Detect speech in current chunk
-                    const hasSpeech = detectSpeechInBuffer(inputData);
+                    // ✅ CRITICAL FIX: Pass playback state to VAD to prevent echo detection
+                    const hasSpeech = detectSpeechInBuffer(inputData, isPlayingAudio);
                     const now = Date.now();
 
                     if (hasSpeech) {
                         if (!isSpeechActive) {
-                            // Speech started
-                            speechStartTime = now;
-                            isSpeechActive = true;
-                            silenceStartTime = null;
-                            log('Speech detected - starting continuous capture');
-                            updateVadStatus('speech');
-
-                            // ✅ CRITICAL FIX: Interrupt audio playback immediately when user speaks
-                            if (isPlayingAudio || audioQueue.length > 0) {
-                                log('🛑 USER INTERRUPTION: Stopping audio playback');
+                            // ✅ CRITICAL FIX: Only trigger interruption if NOT currently playing audio
+                            // This prevents TTS output from being detected as user speech (echo prevention)
+                            if (!isPlayingAudio) {
+                                // Speech started - no audio playing, safe to capture
+                                speechStartTime = now;
+                                isSpeechActive = true;
+                                silenceStartTime = null;
+                                log('Speech detected - starting continuous capture');
+                                updateVadStatus('speech');
+                            } else {
+                                // ✅ CRITICAL FIX: Audio is playing - this might be echo or real interruption
+                                // The higher threshold in detectSpeechInBuffer already filtered weak signals
+                                // If we're here, it's likely a real user interruption
+                                log('🛑 USER INTERRUPTION: High-confidence speech detected during playback');
 
                                 // Stop current audio immediately
                                 if (currentAudio) {
@@ -1558,6 +1613,12 @@ async def home(request: Request):
                                         conversation_id: currentConversationId
                                     }));
                                 }
+
+                                // Now start capturing new speech
+                                speechStartTime = now;
+                                isSpeechActive = true;
+                                silenceStartTime = null;
+                                updateVadStatus('speech');
                             }
                         }
                         lastSpeechTime = now;

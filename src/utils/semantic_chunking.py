@@ -13,16 +13,19 @@ from enum import Enum
 chunk_logger = logging.getLogger("semantic_chunking")
 chunk_logger.setLevel(logging.INFO)
 
-def preprocess_text_for_tts(text: str) -> str:
+def preprocess_text_for_tts(text: str, enhance_prosody: bool = True) -> str:
     """
-    Preprocess text to remove markdown formatting and problematic characters
-    that cause TTS delays or errors.
+    ✅ ENHANCED: Preprocess text to remove markdown formatting and enhance prosody
+
+    Removes problematic characters that cause TTS delays or errors.
+    Optionally enhances prosody through punctuation for more natural speech.
 
     Args:
         text: Raw text that may contain markdown formatting
+        enhance_prosody: Add prosody markers for natural speech (default: True)
 
     Returns:
-        Cleaned text suitable for TTS synthesis
+        Cleaned text suitable for TTS synthesis with enhanced prosody
     """
     if not text:
         return ""
@@ -52,6 +55,19 @@ def preprocess_text_for_tts(text: str) -> str:
 
     # Remove multiple spaces
     text = re.sub(r'\s+', ' ', text)
+
+    # ✅ NEW: Enhance prosody if requested
+    if enhance_prosody:
+        # Ensure proper spacing after punctuation for natural pauses
+        text = re.sub(r',\s*', ', ', text)  # Comma + space
+        text = re.sub(r'\.\s*', '. ', text)  # Period + space
+        text = re.sub(r'!\s*', '! ', text)  # Exclamation + space
+        text = re.sub(r'\?\s*', '? ', text)  # Question + space
+
+        # Remove excessive punctuation that can cause issues
+        text = re.sub(r'\.{4,}', '...', text)  # Multiple dots -> ellipsis
+        text = re.sub(r'!{2,}', '!', text)     # Multiple exclamations -> single
+        text = re.sub(r'\?{2,}', '?', text)    # Multiple questions -> single
 
     # Final strip
     text = text.strip()

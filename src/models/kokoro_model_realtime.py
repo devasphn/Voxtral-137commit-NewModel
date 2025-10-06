@@ -280,8 +280,9 @@ class KokoroTTSModel:
                 text = text[:self.max_text_length]
                 tts_logger.warning(f"⚠️ Text truncated to {self.max_text_length} characters for streaming chunk {chunk_id}")
 
+            # ✅ CRITICAL FIX: Updated to new PyTorch autocast syntax (torch.amp.autocast)
             # ULTRA-LOW LATENCY: TRUE STREAMING - Yield each chunk immediately
-            with torch.cuda.amp.autocast(enabled=True):  # Use mixed precision for speed
+            with torch.amp.autocast('cuda', enabled=True):  # Use mixed precision for speed
                 generator = self.pipeline(text, voice=voice, speed=speed)
 
             chunk_count = 0
