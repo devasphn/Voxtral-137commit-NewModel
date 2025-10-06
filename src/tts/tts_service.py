@@ -19,12 +19,15 @@ tts_service_logger = logging.getLogger("tts_service")
 tts_service_logger.setLevel(logging.INFO)
 
 def map_voice_to_kokoro(voice_name: str) -> str:
-    """Map voice requests to appropriate Kokoro voices"""
+    """
+    ✅ CRITICAL FIX: Map voice requests to appropriate Kokoro voices
+    Default to English voice since Voxtral generates English responses
+    """
     if voice_name in ["ऋतिका", "ritika"]:
         return "hm_omega"  # Hindi male voice
     elif voice_name in ["hindi", "हिंदी"]:
-        return "hm_omega"  # Default Hindi voice
-    # Default to English female voice for unknown voices
+        return "hm_omega"  # Hindi voice
+    # ✅ FIXED: Default to English female voice to match Voxtral output language
     return "af_heart"
 
 class TTSService:
@@ -37,8 +40,8 @@ class TTSService:
         self.kokoro_model = KokoroTTSModel()
         self.is_initialized = False
 
-        # Configuration from config file
-        self.default_voice = "hm_omega"  # Use Kokoro Hindi voice instead of ऋतिका
+        # ✅ CRITICAL FIX: Configuration from config file - use English voice
+        self.default_voice = "af_heart"  # ✅ FIXED: English voice (was hm_omega Hindi)
         self.sample_rate = config.tts.sample_rate
         self.enabled = config.tts.enabled
 

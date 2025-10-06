@@ -1291,10 +1291,11 @@ async def home(request: Request):
                     const audioBlob = new Blob([bytes], { type: 'audio/wav' });
                     const audioUrl = URL.createObjectURL(audioBlob);
 
-                    // Create audio element with enhanced configuration
+                    // ✅ CRITICAL FIX: Create audio element with immediate playback configuration
                     const audio = new Audio();
-                    audio.preload = 'auto';
+                    audio.preload = 'auto';  // Preload entire audio for immediate playback
                     audio.volume = 1.0;
+                    audio.autoplay = false;  // We'll control playback manually for better timing
 
                     // ✅ FIX: Enhanced audio debugging with proper metadata and sample rate
                     log(`🎵 Audio metadata: ${JSON.stringify(metadata)}`);
@@ -1361,19 +1362,24 @@ async def home(request: Request):
                         resolve(); // Don't reject on abort, just continue
                     });
 
-                    // Set source and start loading
+                    // ✅ CRITICAL FIX: Set source and start playback IMMEDIATELY
                     audio.src = audioUrl;
 
-                    // Start playback with retry logic
-                    const playWithRetry = async (retries = 3) => {
+                    // ✅ CRITICAL FIX: Load audio data immediately
+                    audio.load();
+
+                    // ✅ CRITICAL FIX: Start playback as soon as possible with aggressive retry logic
+                    const playWithRetry = async (retries = 5) => {  // Increased retries
                         try {
+                            // Try to play immediately
                             await audio.play();
                         } catch (playError) {
                             log(`⚠️ Play attempt failed for chunk ${chunkId}: ${playError.message}`);
 
                             if (retries > 0 && !playError.message.includes('aborted')) {
                                 log(`🔄 Retrying playback for chunk ${chunkId} (${retries} attempts left)`);
-                                setTimeout(() => playWithRetry(retries - 1), 200);
+                                // ✅ CRITICAL FIX: Reduced retry delay from 200ms to 50ms for faster playback
+                                setTimeout(() => playWithRetry(retries - 1), 50);
                             } else {
                                 URL.revokeObjectURL(audioUrl);
                                 currentAudio = null;
@@ -1525,6 +1531,34 @@ async def home(request: Request):
                             silenceStartTime = null;
                             log('Speech detected - starting continuous capture');
                             updateVadStatus('speech');
+
+                            // ✅ CRITICAL FIX: Interrupt audio playback immediately when user speaks
+                            if (isPlayingAudio || audioQueue.length > 0) {
+                                log('🛑 USER INTERRUPTION: Stopping audio playback');
+
+                                // Stop current audio immediately
+                                if (currentAudio) {
+                                    currentAudio.pause();
+                                    currentAudio.currentTime = 0;
+                                    currentAudio = null;
+                                }
+
+                                // Clear audio queue
+                                const clearedCount = audioQueue.length;
+                                audioQueue = [];
+                                isPlayingAudio = false;
+
+                                log(`🗑️ Cleared ${clearedCount} pending audio chunks due to user interruption`);
+
+                                // Send interruption signal to server
+                                if (ws && ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify({
+                                        type: 'user_interrupt',
+                                        timestamp: now,
+                                        conversation_id: currentConversationId
+                                    }));
+                                }
+                            }
                         }
                         lastSpeechTime = now;
                     } else {
@@ -1848,9 +1882,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif msg_type == "speech_to_speech":
                     await handle_speech_to_speech_chunked_streaming(websocket, message, client_id)
 
+                elif msg_type == "user_interrupt":
+                    # ✅ CRITICAL FIX: Handle user interruption signal
+                    streaming_logger.info(f"🛑 USER INTERRUPTION received from {client_id}")
+
+                    # Find and interrupt all active conversations for this client
+                    interrupted_count = 0
+                    for conv_id in list(audio_queue_manager.conversation_queues.keys()):
+                        if conv_id.startswith(client_id) or client_id in conv_id:
+                            try:
+                                await audio_queue_manager.interrupt_playback(conv_id)
+                                interrupted_count += 1
+                            except Exception as e:
+                                streaming_logger.error(f"❌ Error interrupting {conv_id}: {e}")
+
+                    streaming_logger.info(f"✅ Interrupted {interrupted_count} active conversations for {client_id}")
+
                 elif msg_type == "ping":
                     await websocket.send_text(json.dumps({
-                        "type": "pong", 
+                        "type": "pong",
                         "timestamp": time.time()
                     }))
                     
@@ -2403,10 +2453,11 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                             # ULTRA-FAST TTS WITH QUEUE MANAGEMENT
                             tts_start = time.time()
                             try:
+                                # ✅ CRITICAL FIX: Use English voice to match Voxtral output language
                                 # Stream TTS audio chunks - TRUE STREAMING
                                 async for tts_chunk in kokoro_model.synthesize_speech_streaming(
                                     chunk_text,
-                                    voice="hm_omega",
+                                    voice="af_heart",  # ✅ FIXED: English voice (was hm_omega Hindi)
                                     chunk_id=f"{chunk_id}_word_{word_count}"
                                 ):
                                     if tts_chunk.get('audio_chunk') is not None:
@@ -2531,10 +2582,11 @@ async def handle_conversational_audio_chunk(websocket: WebSocket, data: dict, cl
                                     "voice": "hm_omega"  # Kokoro Hindi voice
                                 })
 
+                                # ✅ CRITICAL FIX: Use English voice to match Voxtral output language
                                 # Generate speech using Kokoro TTS model
                                 result = await kokoro_model.synthesize_speech(
                                     text=response,
-                                    voice="hm_omega"  # Use Kokoro Hindi voice instead of ऋतिका
+                                    voice="af_heart"  # ✅ FIXED: English voice (was hm_omega Hindi)
                                 )
 
                                 if not result.get("success", False):
@@ -2689,36 +2741,41 @@ async def initialize_models_at_startup():
                     voxtral_model = await unified_manager.get_voxtral_model()
                     streaming_logger.info("   🔥 Warming up Voxtral model...")
 
-                    # Run a quick inference to load model into GPU memory
-                    warmup_count = 0
-                    async for chunk in voxtral_model.process_chunked_streaming(
-                        dummy_audio,
-                        prompt=None,
-                        chunk_id="warmup",
-                        mode="chunked_streaming"
-                    ):
-                        warmup_count += 1
-                        # Just consume the chunks, don't process them
-                        if warmup_count >= 3:  # Process a few chunks then stop
-                            break
+                    # ✅ ENHANCED: Run multiple warm-up cycles for thorough initialization
+                    for warmup_cycle in range(2):  # Run 2 warm-up cycles
+                        warmup_count = 0
+                        async for chunk in voxtral_model.process_chunked_streaming(
+                            dummy_audio,
+                            prompt=None,
+                            chunk_id=f"warmup_{warmup_cycle}",
+                            mode="chunked_streaming"
+                        ):
+                            warmup_count += 1
+                            # Just consume the chunks, don't process them
+                            if warmup_count >= 5:  # Process more chunks for thorough warm-up
+                                break
+                        streaming_logger.info(f"   ✅ Voxtral warm-up cycle {warmup_cycle + 1}/2 complete ({warmup_count} chunks)")
 
-                    # Warm-up Kokoro TTS model
+                    # Warm-up Kokoro TTS model with multiple samples
                     kokoro_model = await unified_manager.get_kokoro_model()
                     streaming_logger.info("   🔥 Warming up Kokoro TTS model...")
 
-                    # Run a quick TTS synthesis
-                    warmup_tts_count = 0
-                    async for tts_chunk in kokoro_model.synthesize_speech_streaming(
-                        "Hello",
-                        voice="hm_omega",
-                        chunk_id="warmup_tts"
-                    ):
-                        warmup_tts_count += 1
-                        if warmup_tts_count >= 2:  # Process a couple chunks then stop
-                            break
+                    # ✅ ENHANCED: Run multiple TTS syntheses to warm up phonemizer with English voice
+                    warmup_texts = ["Hello", "How are you", "This is a test"]
+                    for idx, text in enumerate(warmup_texts):
+                        warmup_tts_count = 0
+                        async for tts_chunk in kokoro_model.synthesize_speech_streaming(
+                            text,
+                            voice="af_heart",  # ✅ FIXED: English voice (was hm_omega Hindi)
+                            chunk_id=f"warmup_tts_{idx}"
+                        ):
+                            warmup_tts_count += 1
+                            if warmup_tts_count >= 3:  # Process a few chunks then stop
+                                break
+                        streaming_logger.info(f"   ✅ Kokoro TTS warm-up {idx + 1}/3 complete ({warmup_tts_count} chunks)")
 
                     warmup_time = (time.time() - warmup_start) * 1000
-                    streaming_logger.info(f"✅ Warm-up complete in {warmup_time:.1f}ms - Models ready for ultra-low latency!")
+                    streaming_logger.info(f"✅ Comprehensive warm-up complete in {warmup_time:.1f}ms - Cold start eliminated!")
 
                 except Exception as warmup_error:
                     streaming_logger.warning(f"⚠️ Warm-up inference failed (non-critical): {warmup_error}")

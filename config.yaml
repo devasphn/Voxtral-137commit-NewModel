@@ -49,13 +49,13 @@ streaming:
 # TTS (Text-to-Speech) configuration - Kokoro TTS
 tts:
   engine: "kokoro"
-  default_voice: "hm_omega"  # Kokoro Hindi voice (replaces ऋतिका)
+  default_voice: "af_heart"  # ✅ CRITICAL FIX: Changed to English voice to match Voxtral output language
   sample_rate: 24000
   enabled: true
   # Kokoro TTS settings
-  voice: "hm_omega"  # Kokoro Hindi voice
+  voice: "af_heart"  # ✅ CRITICAL FIX: English voice (was hm_omega Hindi voice)
   speed: 1.0  # Kokoro speech speed
-  lang_code: "h"  # Kokoro language code (h=Hindi, a=American English, b=British English)
+  lang_code: "a"  # ✅ CRITICAL FIX: American English (was "h" Hindi) - eliminates phonemizer warnings
   # Available voices by language - Kokoro voices only
   voices:
     english: ["af_heart", "af_bella", "af_nicole", "af_sarah"]  # Kokoro English voices
